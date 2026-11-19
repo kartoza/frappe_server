@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Python
+api/.venv/
+api/__pycache__/
+api/**/__pycache__/
+api/**/*.pyc
+api/*.sqlite3
+
+# Node / frontend build output
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+web/vite.config.js
+web/vite.config.d.ts
+
+# Editor/OS
+.DS_Store
