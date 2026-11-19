@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError, downloadFile, postForm } from '../api/client';
 import type { App, Backup, Bench, Job, Site } from '../api/types';
 import JobLogViewer from '../components/JobLogViewer';
@@ -47,6 +47,7 @@ const RESTORE_ITEMS: RestoreItem[] = [
 
 export default function SiteDetail() {
   const { id } = useParams();
+  const navigate = useNavigate();
   const [site, setSite] = useState<Site | null>(null);
   const [tab, setTab] = useState<Tab>('overview');
   const [backups, setBackups] = useState<Backup[]>([]);
@@ -100,6 +101,24 @@ export default function SiteDetail() {
     });
     setActiveJobId(result.job_id);
     refreshSite();
+  }
+
+  async function handleDeleteSite() {
+    if (!site) return;
+    if (
+      !window.confirm(
+        `Delete ${site.hostname}? This permanently drops its database and files.`
+      )
+    ) {
+      return;
+    }
+    setError('');
+    try {
+      await api.delete(`/sites/${id}/`);
+      navigate(`/benches/${site.bench}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not delete site.');
+    }
   }
 
   async function handleInstallApp(appId: number) {
@@ -176,7 +195,15 @@ export default function SiteDetail() {
             Open site &rarr;
           </a>
         </div>
-        <StatusBadge status={site.status} />
+        <div className="flex items-center gap-3">
+          <StatusBadge status={site.status} />
+          <button
+            onClick={handleDeleteSite}
+            className="text-sm text-rose-400 hover:text-rose-300"
+          >
+            Delete site
+          </button>
+        </div>
       </div>
 
       <div className="mb-6 flex gap-2 border-b border-slate-800">

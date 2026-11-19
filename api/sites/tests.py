@@ -174,6 +174,72 @@ class SiteAppMustBeFetchedTests(APITestCase):
         mock_task.delay.assert_called_once()
 
 
+class DeleteSiteTests(APITestCase):
+    """Deleting a site drops its database/files on the bench and removes
+    it from nginx routing — this is async (a Job), not immediate."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='admin@example.com', password='s3cret-pass', is_staff=True
+        )
+        self.client.force_authenticate(user=self.user)
+        server = Server.objects.create(name='localhost')
+        self.bench = Bench.objects.create(
+            server=server, name='bench-a', frappe_branch='version-15',
+            status=Bench.STATUS_ACTIVE,
+        )
+        self.site = Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+
+    @patch('sites.views.delete_site_task')
+    def test_destroy_marks_deleting_and_enqueues_job(self, mock_task):
+        response = self.client.delete(f'/api/sites/{self.site.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertIn('job_id', response.data)
+        mock_task.delay.assert_called_once()
+        self.site.refresh_from_db()
+        self.assertEqual(self.site.status, Site.STATUS_DELETING)
+        job = Job.objects.get(pk=response.data['job_id'])
+        self.assertEqual(job.job_type, Job.TYPE_SITE_DELETE)
+        self.assertEqual(job.site, self.site)
+
+    @patch('sites.tasks.nginx_config.regenerate_and_reload')
+    @patch('sites.tasks.bench_exec.drop_site')
+    def test_delete_site_task_drops_site_and_regenerates_nginx(self, mock_drop, mock_reload):
+        from .tasks import delete_site_task
+
+        job = Job.objects.create(job_type=Job.TYPE_SITE_DELETE, site=self.site, bench=self.bench)
+        site_id = self.site.id
+
+        delete_site_task(site_id, job.id)
+
+        mock_drop.assert_called_once()
+        mock_reload.assert_called_once()
+        self.assertFalse(Site.objects.filter(pk=site_id).exists())
+        job.refresh_from_db()
+        self.assertEqual(job.status, Job.STATUS_SUCCESS)
+
+    @patch('sites.tasks.nginx_config.regenerate_and_reload')
+    @patch('sites.tasks.bench_exec.drop_site', side_effect=RuntimeError('drop-site failed'))
+    def test_delete_site_task_marks_error_and_keeps_site_on_failure(self, mock_drop, mock_reload):
+        from .tasks import delete_site_task
+
+        job = Job.objects.create(job_type=Job.TYPE_SITE_DELETE, site=self.site, bench=self.bench)
+
+        delete_site_task(self.site.id, job.id)
+
+        self.assertTrue(Site.objects.filter(pk=self.site.id).exists())
+        self.site.refresh_from_db()
+        self.assertEqual(self.site.status, Site.STATUS_ERROR)
+        self.assertEqual(self.site.error_message, 'drop-site failed')
+        mock_reload.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, Job.STATUS_FAILED)
+
+
 class OrphanedJobReconciliationTests(TestCase):
     def test_running_jobs_are_marked_failed_queued_jobs_are_untouched(self):
         from platform_api.celery import reconcile_orphaned_jobs
