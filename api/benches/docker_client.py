@@ -10,7 +10,7 @@ import time
 import docker
 from django.conf import settings
 
-from .container_exec import get_client, run_command
+from .container_exec import get_client, run_command, tail_container_logs
 
 REDIS_IMAGE = 'redis:7-alpine'
 
@@ -74,14 +74,29 @@ def remove_bench_containers(bench, remove_volume=True):
             pass
 
 
-def wait_for_bench_ready(bench, timeout=300, interval=5):
+def wait_for_bench_ready(bench, timeout=300, interval=5, on_output=None, since=None):
     """Poll a bench container until its web process accepts connections.
+
+    Also tails the container's own stdout/stderr (the entrypoint's
+    ``bench init`` output, which can run for most of this wait) into
+    ``on_output`` each iteration, so there's something to show while
+    this otherwise-silent wait is in progress.
+
+    :param since: Unix timestamp to start tailing logs from. Pass the time
+        just before the container was created so none of the entrypoint's
+        early output (DB/Redis wait, ``bench init`` start) is missed;
+        defaults to now.
 
     :raises TimeoutError: if the bench isn't ready within ``timeout`` seconds.
     """
     deadline = time.time() + timeout
     last_error = ''
+    since = since if since is not None else time.time()
     while time.time() < deadline:
+        if on_output:
+            since, new_output = tail_container_logs(bench.container_name, since)
+            if new_output:
+                on_output(new_output)
         try:
             exit_code, _ = run_command(
                 bench.container_name,

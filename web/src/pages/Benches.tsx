@@ -1,10 +1,11 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api/client';
 import type { Bench } from '../api/types';
 import StatusBadge from '../components/StatusBadge';
 
 export default function Benches() {
+  const navigate = useNavigate();
   const [benches, setBenches] = useState<Bench[] | null>(null);
   const [name, setName] = useState('');
   const [branch, setBranch] = useState('version-15');
@@ -23,9 +24,11 @@ export default function Benches() {
     event.preventDefault();
     setError('');
     try {
-      await api.post('/benches/', { name, frappe_branch: branch });
+      // Jump straight to the detail page — it already shows live job
+      // output (see JobLogViewer) while the bench's status is "creating".
+      const bench = await api.post<Bench>('/benches/', { name, frappe_branch: branch });
       setName('');
-      refresh();
+      navigate(`/benches/${bench.id}`);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not create bench.');
     }

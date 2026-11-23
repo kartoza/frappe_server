@@ -60,6 +60,27 @@ def exec_stream(container_name, command, *, user=None, workdir=None, on_output=N
     return client.api.exec_inspect(exec_id).get('ExitCode', 1)
 
 
+def tail_container_logs(container_name, since):
+    """Fetch a container's own stdout/stderr emitted after ``since``.
+
+    Used to surface a container's *main process* output (e.g. a bench
+    container's entrypoint running ``bench init``) rather than an exec'd
+    command's — there's no exec to stream in that case, just the
+    container's own log stream polled incrementally.
+
+    :param since: Unix timestamp (as returned by a previous call, or
+        ``time.time()`` for the first call) to fetch logs after.
+    :returns: ``(next_since, text)`` — pass ``next_since`` back in on the
+        next call to avoid re-fetching the same lines.
+    :rtype: (float, str)
+    """
+    client = get_client()
+    container = client.containers.get(container_name)
+    next_since = time.time()
+    chunk = container.logs(stdout=True, stderr=True, since=since, until=next_since)
+    return next_since, chunk.decode('utf-8', errors='replace')
+
+
 def run_command(container_name, command, **kwargs):
     """Run a command inside a container, collecting all output into a string.
 

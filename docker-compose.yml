@@ -117,9 +117,12 @@ services:
     # Fixed name so the API/worker can reach this container deterministically
     # (e.g. to trigger `nginx -s reload`) regardless of the Compose project name.
     container_name: frappe-platform-proxy
+    # Needed so PLATFORM_DOMAINS (see .env) is in the container's environment
+    # for nginx's entrypoint to envsubst into nginx.conf at boot.
+    env_file: .env
     ports:
-      - "80:80"
-      - "443:443"
+      - "82:80"
+      - "445:443"
     volumes:
       - nginx_conf:/etc/nginx/conf.d/sites
       - ssl_certs:/etc/letsencrypt:ro

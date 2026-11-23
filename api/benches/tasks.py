@@ -1,4 +1,6 @@
 """Celery tasks for bench-unit lifecycle (create/delete)."""
+import time
+
 from celery import shared_task
 
 from .docker_client import (
@@ -25,9 +27,10 @@ def create_bench_task(bench_id, job_id):
         job.append_log(
             f'Creating bench "{bench.name}" on branch {bench.frappe_branch}...\n'
         )
+        since = time.time()
         create_bench_containers(bench)
         job.append_log('Waiting for bench to become ready...\n')
-        wait_for_bench_ready(bench)
+        wait_for_bench_ready(bench, on_output=job.append_log, since=since)
         bench.status = Bench.STATUS_ACTIVE
         bench.save(update_fields=['status'])
         job.append_log('Bench is active.\n')
