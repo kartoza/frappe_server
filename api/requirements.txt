@@ -7,3 +7,12 @@ psycopg2-binary==2.9.9
 docker==7.1.0
 gunicorn==22.0.0
 dj-database-url==2.2.0
+certbot==2.11.0
+# certbot doesn't declare a tight enough upper bound on these two — pip
+# resolving the newest available pyOpenSSL/cryptography at build time
+# pulled in versions that dropped the pyOpenSSL API certbot 2.11.0's
+# acme library still calls (crypto.X509Req), crashing every invocation.
+# Pinned to a pair known compatible with this certbot release.
+pyOpenSSL==24.2.1
+cryptography==42.0.8
+PyMySQL==1.1.1

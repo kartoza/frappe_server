@@ -93,6 +93,26 @@ export interface Invite {
   accepted_at: string | null;
 }
 
+export interface SqlResultSet {
+  columns: string[];
+  rows: unknown[][];
+  truncated: boolean;
+}
+
+export interface SqlDatabase {
+  name: string;
+  // Hostname of the site this database belongs to, where known — derived
+  // server-side from each active site's own site_config.json, since
+  // nothing ties a db name back to a site other than that file.
+  site: string | null;
+}
+
+export interface SqlAffectedRows {
+  affected_rows: number;
+}
+
+export type SqlStatementResult = SqlResultSet | SqlAffectedRows;
+
 export interface Job {
   id: number;
   job_type: string;

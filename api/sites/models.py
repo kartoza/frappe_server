@@ -4,6 +4,20 @@ from django.db import models
 from django.utils import timezone
 
 
+def is_hostname_allowed(hostname):
+    """Check a candidate site hostname against settings.ALLOWED_SITE_DOMAINS.
+
+    Allowed if it's exactly one of the configured domains or any
+    subdomain of one — so a domain entry of "kartoza.com" covers both
+    "kartoza.com" itself and "shop.kartoza.com".
+    """
+    hostname = hostname.lower()
+    return any(
+        hostname == domain or hostname.endswith(f'.{domain}')
+        for domain in settings.ALLOWED_SITE_DOMAINS
+    )
+
+
 class App(models.Model):
     """An installable Frappe app (e.g. ERPNext, HRMS).
 

@@ -4,6 +4,8 @@ Each function runs one bench command inside the target bench's container,
 streaming output into the given Job's log, and raises on a non-zero exit
 code so the calling Celery task can mark the job failed.
 """
+import json
+
 from django.conf import settings
 
 from benches import container_exec
@@ -246,6 +248,27 @@ def restore_site_config(bench, site, data):
     """Overwrite a site's site_config.json with uploaded content."""
     target_dir = f'{bench.bench_path}/sites/{site.hostname}'
     container_exec.put_bytes(bench.container_name, target_dir, 'site_config.json', data)
+
+
+def get_db_name(bench, site):
+    """Read a site's own db_name out of its site_config.json, or None.
+
+    Frappe derives the db name from a hash of the site name at creation
+    time — nothing on the ``Site`` row itself records it — so this is the
+    only way to label a raw MariaDB database with which site it actually
+    belongs to (see the SQL playground's database list).
+    """
+    exit_code, output = run_command(
+        bench.container_name,
+        ['cat', f'{bench.bench_path}/sites/{site.hostname}/site_config.json'],
+        user=BENCH_USER,
+    )
+    if exit_code != 0:
+        return None
+    try:
+        return json.loads(output).get('db_name')
+    except ValueError:
+        return None
 
 
 def _strip_before_marker(marker):

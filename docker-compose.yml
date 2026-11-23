@@ -7,6 +7,8 @@ volumes:
   mariadb_data:
   nginx_conf:
   upload_staging:
+  ssl_certs:
+  ssl_webroot:
 
 services:
   postgres:
@@ -73,6 +75,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - upload_staging:/app/upload_staging
+      - ssl_certs:/etc/letsencrypt
+      - ssl_webroot:/var/www/certbot
     networks: [frappe-platform-net]
     command: >
       sh -c "python manage.py migrate --noinput &&
@@ -98,8 +102,13 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - nginx_conf:/nginx_conf
       - upload_staging:/app/upload_staging
+      - ssl_certs:/etc/letsencrypt
+      - ssl_webroot:/var/www/certbot
     networks: [frappe-platform-net]
-    command: celery -A platform_api worker -l info --concurrency=4
+    # -B embeds Celery beat (the SSL renewal schedule, see
+    # platform_api/celery.py) in this same process — see the note there
+    # on why that's fine for this v1 single-worker-replica deployment.
+    command: celery -A platform_api worker -B -l info --concurrency=4
 
   proxy:
     build:
@@ -110,8 +119,11 @@ services:
     container_name: frappe-platform-proxy
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - nginx_conf:/etc/nginx/conf.d/sites
+      - ssl_certs:/etc/letsencrypt:ro
+      - ssl_webroot:/var/www/certbot:ro
     depends_on:
       - api
     networks: [frappe-platform-net]

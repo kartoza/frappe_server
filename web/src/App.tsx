@@ -11,6 +11,7 @@ import NewSiteWizard from './pages/NewSiteWizard';
 import Profile from './pages/Profile';
 import Settings from './pages/Settings';
 import SiteDetail from './pages/SiteDetail';
+import SqlPlayground from './pages/SqlPlayground';
 import Users from './pages/Users';
 
 function ProtectedRoute({ children }: { children: ReactElement }) {
@@ -49,6 +50,14 @@ function AppRoutes() {
                   element={
                     <AdminRoute>
                       <Users />
+                    </AdminRoute>
+                  }
+                />
+                <Route
+                  path="/sql"
+                  element={
+                    <AdminRoute>
+                      <SqlPlayground />
                     </AdminRoute>
                   }
                 />

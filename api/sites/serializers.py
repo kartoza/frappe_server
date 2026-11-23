@@ -1,6 +1,7 @@
+from django.conf import settings
 from rest_framework import serializers
 
-from .models import App, Backup, BenchApp, Job, Site, SiteApp
+from .models import App, Backup, BenchApp, Job, Site, SiteApp, is_hostname_allowed
 
 
 class AppSerializer(serializers.ModelSerializer):
@@ -44,6 +45,20 @@ class SiteSerializer(serializers.ModelSerializer):
             'installed_apps',
         )
         extra_kwargs = {'admin_password': {'write_only': True}}
+
+    def validate_hostname(self, value):
+        """Reject hostnames outside the configured domain whitelist.
+
+        nginx will happily route any hostname given to it — this is the
+        actual gate against creating a site under a domain the operator
+        doesn't control (see settings.ALLOWED_SITE_DOMAINS).
+        """
+        if not is_hostname_allowed(value):
+            allowed = ', '.join(settings.ALLOWED_SITE_DOMAINS)
+            raise serializers.ValidationError(
+                f'"{value}" is not under an allowed domain. Allowed: {allowed}.'
+            )
+        return value
 
     def validate(self, attrs):
         """Reject apps that aren't already fetched onto the target bench.

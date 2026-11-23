@@ -13,9 +13,11 @@ from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+import pymysql
+
 from benches.models import Bench, Server
 
-from . import nginx_config
+from . import nginx_config, sql_playground
 from .models import App, Job, Site
 
 
@@ -60,6 +62,80 @@ class SiteHostnameTests(TestCase):
         self.assertEqual(site.hostname, 'mysite.localhost')
 
 
+class HostnameDomainWhitelistTests(APITestCase):
+    """A site's hostname must fall under settings.ALLOWED_SITE_DOMAINS —
+    nginx itself will route any hostname it's given, so this is the real
+    gate against creating a site under a domain the operator doesn't
+    control."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='admin@example.com', password='s3cret-pass', is_staff=True
+        )
+        self.client.force_authenticate(user=self.user)
+        server = Server.objects.create(name='localhost')
+        self.bench = Bench.objects.create(
+            server=server, name='bench-a', frappe_branch='version-15',
+            status=Bench.STATUS_ACTIVE,
+        )
+
+    def test_is_hostname_allowed_matches_exact_domain_and_subdomains(self):
+        from django.test import override_settings
+        from .models import is_hostname_allowed
+
+        with override_settings(ALLOWED_SITE_DOMAINS=['localhost', 'kartoza.com']):
+            self.assertTrue(is_hostname_allowed('localhost'))
+            self.assertTrue(is_hostname_allowed('demo.localhost'))
+            self.assertTrue(is_hostname_allowed('kartoza.com'))
+            self.assertTrue(is_hostname_allowed('shop.kartoza.com'))
+            self.assertFalse(is_hostname_allowed('evil.com'))
+            # A domain that merely *ends with* an allowed one isn't a
+            # subdomain of it — "notkartoza.com" must not sneak through.
+            self.assertFalse(is_hostname_allowed('notkartoza.com'))
+
+    @patch('sites.views.create_site_task')
+    def test_create_site_rejects_hostname_outside_whitelist(self, mock_task):
+        response = self.client.post('/api/sites/', {
+            'bench': self.bench.id,
+            'hostname': 'demo.evil.com',
+            'admin_password': 'pw',
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_task.delay.assert_not_called()
+        self.assertFalse(Site.objects.filter(hostname='demo.evil.com').exists())
+
+    @patch('sites.views.create_site_task')
+    def test_create_site_accepts_hostname_under_default_localhost_domain(self, mock_task):
+        response = self.client.post('/api/sites/', {
+            'bench': self.bench.id,
+            'hostname': 'demo.localhost',
+            'admin_password': 'pw',
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mock_task.delay.assert_called_once()
+
+    @patch('sites.views.create_site_task')
+    def test_create_site_accepts_custom_domain_once_whitelisted(self, mock_task):
+        from django.test import override_settings
+
+        with override_settings(ALLOWED_SITE_DOMAINS=['localhost', 'kartoza.com']):
+            response = self.client.post('/api/sites/', {
+                'bench': self.bench.id,
+                'hostname': 'shop.kartoza.com',
+                'admin_password': 'pw',
+            })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mock_task.delay.assert_called_once()
+
+    def test_allowed_domains_endpoint_reflects_setting(self):
+        from django.test import override_settings
+
+        with override_settings(ALLOWED_SITE_DOMAINS=['localhost', 'kartoza.com']):
+            response = self.client.get('/api/sites/allowed-domains/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['domains'], ['localhost', 'kartoza.com'])
+
+
 class NginxConfigTests(TestCase):
     def setUp(self):
         server = Server.objects.create(name='localhost')
@@ -100,6 +176,222 @@ class NginxConfigTests(TestCase):
         self.assertNotIn('pending.localhost', content)
         self.assertIn(self.bench.container_name, content)
         mock_run_command.assert_called_once()
+
+    @patch('sites.ssl.has_cert', return_value=True)
+    @patch('sites.nginx_config.run_command', return_value=(0, ''))
+    @patch('sites.nginx_config._redis_client')
+    def test_regenerate_renders_https_block_once_a_cert_exists(
+        self, mock_redis_client, mock_run_command, mock_has_cert
+    ):
+        Site.objects.create(
+            bench=self.bench, hostname='shop.kartoza.com', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        mock_lock = MagicMock()
+        mock_lock.__enter__ = MagicMock(return_value=None)
+        mock_lock.__exit__ = MagicMock(return_value=False)
+        mock_redis_client.return_value.lock.return_value = mock_lock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.settings(NGINX_CONF_DIR=tmp_dir, SSL_ENABLED=True):
+                nginx_config.regenerate_and_reload()
+                with open(f'{tmp_dir}/sites.conf', encoding='utf-8') as handle:
+                    content = handle.read()
+
+        self.assertIn('listen 443 ssl', content)
+        self.assertIn('ssl_certificate', content)
+        self.assertIn('return 301 https', content)
+        # Braces must have fully resolved — a leftover "{{"/"}}" would mean
+        # an un-.format()'d template fragment slipped into the real file.
+        self.assertNotIn('{{', content)
+        self.assertNotIn('}}', content)
+
+    @patch('sites.ssl.has_cert', return_value=True)
+    @patch('sites.nginx_config.run_command', return_value=(0, ''))
+    @patch('sites.nginx_config._redis_client')
+    def test_regenerate_skips_https_block_when_ssl_disabled_even_with_a_cert(
+        self, mock_redis_client, mock_run_command, mock_has_cert
+    ):
+        """A cert could be sitting on disk from before SSL_ENABLED was
+        turned off again — must not serve HTTPS in that case."""
+        Site.objects.create(
+            bench=self.bench, hostname='shop.kartoza.com', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        mock_lock = MagicMock()
+        mock_lock.__enter__ = MagicMock(return_value=None)
+        mock_lock.__exit__ = MagicMock(return_value=False)
+        mock_redis_client.return_value.lock.return_value = mock_lock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.settings(NGINX_CONF_DIR=tmp_dir, SSL_ENABLED=False):
+                nginx_config.regenerate_and_reload()
+                with open(f'{tmp_dir}/sites.conf', encoding='utf-8') as handle:
+                    content = handle.read()
+
+        self.assertNotIn('listen 443', content)
+        self.assertIn('listen 80', content)
+
+    @patch('sites.nginx_config.run_command', return_value=(0, ''))
+    @patch('sites.nginx_config._redis_client')
+    def test_every_site_gets_the_acme_challenge_location(self, mock_redis_client, mock_run_command):
+        Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        mock_lock = MagicMock()
+        mock_lock.__enter__ = MagicMock(return_value=None)
+        mock_lock.__exit__ = MagicMock(return_value=False)
+        mock_redis_client.return_value.lock.return_value = mock_lock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.settings(NGINX_CONF_DIR=tmp_dir):
+                nginx_config.regenerate_and_reload()
+                with open(f'{tmp_dir}/sites.conf', encoding='utf-8') as handle:
+                    content = handle.read()
+
+        self.assertIn('/.well-known/acme-challenge/', content)
+
+
+class SslAutomationTests(TestCase):
+    """certbot itself is never actually invoked in tests — these mock the
+    subprocess boundary and check the orchestration logic around it:
+    which hostnames are eligible, and that a batch run reloads nginx."""
+
+    def setUp(self):
+        server = Server.objects.create(name='localhost')
+        self.bench = Bench.objects.create(server=server, name='bench-a')
+
+    def test_eligible_hostnames_excludes_localhost_sites(self):
+        from . import ssl as ssl_module
+
+        Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        Site.objects.create(
+            bench=self.bench, hostname='shop.kartoza.com', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        Site.objects.create(
+            bench=self.bench, hostname='not-active.kartoza.com', admin_password='pw',
+            status=Site.STATUS_CREATING,
+        )
+
+        hostnames = ssl_module.eligible_hostnames()
+        self.assertEqual(hostnames, ['shop.kartoza.com'])
+
+    @patch('sites.ssl.subprocess.run')
+    def test_issue_or_renew_reports_success(self, mock_run):
+        from . import ssl as ssl_module
+
+        mock_run.return_value = MagicMock(returncode=0, stdout='Congratulations!', stderr='')
+        with self.settings(SSL_ENABLED=True):
+            success, output = ssl_module.issue_or_renew('shop.kartoza.com')
+
+        self.assertTrue(success)
+        self.assertIn('Congratulations', output)
+        command = mock_run.call_args[0][0]
+        self.assertIn('certbot', command)
+        self.assertIn('shop.kartoza.com', command)
+
+    @patch('sites.ssl.subprocess.run')
+    def test_issue_or_renew_reports_failure_without_raising(self, mock_run):
+        from . import ssl as ssl_module
+
+        mock_run.return_value = MagicMock(returncode=1, stdout='', stderr='DNS problem')
+        success, output = ssl_module.issue_or_renew('shop.kartoza.com')
+
+        self.assertFalse(success)
+        self.assertIn('DNS problem', output)
+
+    @patch('sites.ssl.subprocess.run', side_effect=TimeoutError('timed out'))
+    def test_issue_or_renew_never_raises_even_on_subprocess_error(self, mock_run):
+        from . import ssl as ssl_module
+
+        success, output = ssl_module.issue_or_renew('shop.kartoza.com')
+        self.assertFalse(success)
+
+    def test_run_for_all_eligible_sites_is_a_noop_when_ssl_disabled(self):
+        from . import ssl as ssl_module
+
+        Site.objects.create(
+            bench=self.bench, hostname='shop.kartoza.com', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        with self.settings(SSL_ENABLED=False):
+            results = ssl_module.run_for_all_eligible_sites()
+        self.assertEqual(results, {})
+
+    @patch('sites.nginx_config.regenerate_and_reload')
+    @patch('sites.ssl.issue_or_renew', return_value=(True, 'ok'))
+    def test_run_for_all_eligible_sites_reloads_nginx_when_something_was_attempted(
+        self, mock_issue, mock_reload
+    ):
+        from . import ssl as ssl_module
+
+        Site.objects.create(
+            bench=self.bench, hostname='shop.kartoza.com', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        with self.settings(SSL_ENABLED=True):
+            results = ssl_module.run_for_all_eligible_sites()
+
+        self.assertEqual(results, {'shop.kartoza.com': (True, 'ok')})
+        mock_reload.assert_called_once()
+
+    @patch('sites.nginx_config.regenerate_and_reload')
+    def test_run_for_all_eligible_sites_skips_reload_when_nothing_eligible(self, mock_reload):
+        from . import ssl as ssl_module
+
+        Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        with self.settings(SSL_ENABLED=True):
+            results = ssl_module.run_for_all_eligible_sites()
+
+        self.assertEqual(results, {})
+        mock_reload.assert_not_called()
+
+
+class IssueSslCertsCommandTests(TestCase):
+    def setUp(self):
+        server = Server.objects.create(name='localhost')
+        self.bench = Bench.objects.create(server=server, name='bench-a')
+
+    def test_command_skips_cleanly_when_ssl_disabled(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        out = StringIO()
+        with self.settings(SSL_ENABLED=False):
+            call_command('issue_ssl_certs', stdout=out)
+        self.assertIn('skipping', out.getvalue())
+
+    @patch('sites.ssl.issue_or_renew', return_value=(True, 'ok'))
+    @patch('sites.nginx_config.regenerate_and_reload')
+    def test_command_reports_results_per_hostname(self, mock_reload, mock_issue):
+        from io import StringIO
+        from django.core.management import call_command
+
+        Site.objects.create(
+            bench=self.bench, hostname='shop.kartoza.com', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        out = StringIO()
+        with self.settings(SSL_ENABLED=True):
+            call_command('issue_ssl_certs', stdout=out)
+        self.assertIn('shop.kartoza.com: ok', out.getvalue())
+
+
+class RenewSslCertsTaskTests(TestCase):
+    @patch('sites.ssl.run_for_all_eligible_sites')
+    def test_task_delegates_to_shared_ssl_logic(self, mock_run):
+        from .tasks import renew_ssl_certs_task
+
+        renew_ssl_certs_task()
+        mock_run.assert_called_once()
 
 
 class SiteAppMustBeFetchedTests(APITestCase):
@@ -172,6 +464,72 @@ class SiteAppMustBeFetchedTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_task.delay.assert_called_once()
+
+
+class DeleteSiteTests(APITestCase):
+    """Deleting a site drops its database/files on the bench and removes
+    it from nginx routing — this is async (a Job), not immediate."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='admin@example.com', password='s3cret-pass', is_staff=True
+        )
+        self.client.force_authenticate(user=self.user)
+        server = Server.objects.create(name='localhost')
+        self.bench = Bench.objects.create(
+            server=server, name='bench-a', frappe_branch='version-15',
+            status=Bench.STATUS_ACTIVE,
+        )
+        self.site = Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+
+    @patch('sites.views.delete_site_task')
+    def test_destroy_marks_deleting_and_enqueues_job(self, mock_task):
+        response = self.client.delete(f'/api/sites/{self.site.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertIn('job_id', response.data)
+        mock_task.delay.assert_called_once()
+        self.site.refresh_from_db()
+        self.assertEqual(self.site.status, Site.STATUS_DELETING)
+        job = Job.objects.get(pk=response.data['job_id'])
+        self.assertEqual(job.job_type, Job.TYPE_SITE_DELETE)
+        self.assertEqual(job.site, self.site)
+
+    @patch('sites.tasks.nginx_config.regenerate_and_reload')
+    @patch('sites.tasks.bench_exec.drop_site')
+    def test_delete_site_task_drops_site_and_regenerates_nginx(self, mock_drop, mock_reload):
+        from .tasks import delete_site_task
+
+        job = Job.objects.create(job_type=Job.TYPE_SITE_DELETE, site=self.site, bench=self.bench)
+        site_id = self.site.id
+
+        delete_site_task(site_id, job.id)
+
+        mock_drop.assert_called_once()
+        mock_reload.assert_called_once()
+        self.assertFalse(Site.objects.filter(pk=site_id).exists())
+        job.refresh_from_db()
+        self.assertEqual(job.status, Job.STATUS_SUCCESS)
+
+    @patch('sites.tasks.nginx_config.regenerate_and_reload')
+    @patch('sites.tasks.bench_exec.drop_site', side_effect=RuntimeError('drop-site failed'))
+    def test_delete_site_task_marks_error_and_keeps_site_on_failure(self, mock_drop, mock_reload):
+        from .tasks import delete_site_task
+
+        job = Job.objects.create(job_type=Job.TYPE_SITE_DELETE, site=self.site, bench=self.bench)
+
+        delete_site_task(self.site.id, job.id)
+
+        self.assertTrue(Site.objects.filter(pk=self.site.id).exists())
+        self.site.refresh_from_db()
+        self.assertEqual(self.site.status, Site.STATUS_ERROR)
+        self.assertEqual(self.site.error_message, 'drop-site failed')
+        mock_reload.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, Job.STATUS_FAILED)
 
 
 class OrphanedJobReconciliationTests(TestCase):
@@ -733,3 +1091,190 @@ class UninstallAppTaskTests(TestCase):
         self.assertFalse(SiteApp.objects.filter(site=self.site, app=self.app).exists())
         job.refresh_from_db()
         self.assertEqual(job.status, Job.STATUS_SUCCESS)
+
+
+def _mock_connection(cursor):
+    """A MagicMock standing in for a pymysql connection, supporting the
+    `with conn.cursor() as cursor:` pattern run_sql/list_databases use."""
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+    conn.cursor.return_value.__exit__.return_value = False
+    return conn
+
+
+class SqlPlaygroundModuleTests(TestCase):
+    """pymysql itself is never actually invoked here — mocked at the
+    connection boundary — these check the orchestration: system schemas
+    are hidden, an unknown database is rejected before connecting, a
+    failed statement rolls back, and multi-statement/large-result-set
+    handling behaves."""
+
+    @patch('sites.sql_playground.pymysql.connect')
+    def test_list_databases_excludes_system_schemas(self, mock_connect):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            ('information_schema',), ('mysql',), ('performance_schema',), ('sys',),
+            ('_def456',), ('_abc123',),
+        ]
+        mock_connect.return_value = _mock_connection(cursor)
+
+        result = sql_playground.list_databases()
+
+        self.assertEqual(result, ['_abc123', '_def456'])  # sorted too
+
+    @patch('sites.sql_playground.pymysql.connect')
+    @patch('sites.sql_playground.list_databases', return_value=['_abc123'])
+    def test_run_sql_rejects_unknown_database(self, mock_list, mock_connect):
+        with self.assertRaises(ValueError):
+            sql_playground.run_sql('not-a-real-db', 'SELECT 1')
+        mock_connect.assert_not_called()
+
+    @patch('sites.sql_playground.pymysql.connect')
+    @patch('sites.sql_playground.list_databases', return_value=['_abc123'])
+    def test_run_sql_returns_affected_rows_for_a_write_statement(self, mock_list, mock_connect):
+        cursor = MagicMock(description=None, rowcount=3)
+        cursor.nextset.return_value = False
+        mock_connect.return_value = _mock_connection(cursor)
+
+        results = sql_playground.run_sql('_abc123', "UPDATE tabUser SET enabled=1")
+
+        self.assertEqual(results, [{'affected_rows': 3}])
+        mock_connect.return_value.commit.assert_called_once()
+
+    @patch('sites.sql_playground.pymysql.connect')
+    @patch('sites.sql_playground.list_databases', return_value=['_abc123'])
+    def test_run_sql_returns_columns_and_rows_for_a_select(self, mock_list, mock_connect):
+        cursor = MagicMock(description=[('id',), ('name',)])
+        cursor.fetchmany.return_value = [(1, 'Ada'), (2, 'Grace')]
+        cursor.fetchone.return_value = None
+        cursor.nextset.return_value = False
+        mock_connect.return_value = _mock_connection(cursor)
+
+        results = sql_playground.run_sql('_abc123', 'SELECT id, name FROM tabUser')
+
+        self.assertEqual(results, [{
+            'columns': ['id', 'name'], 'rows': [[1, 'Ada'], [2, 'Grace']], 'truncated': False,
+        }])
+
+    @patch('sites.sql_playground.pymysql.connect')
+    @patch('sites.sql_playground.list_databases', return_value=['_abc123'])
+    def test_run_sql_flags_truncated_when_more_rows_remain(self, mock_list, mock_connect):
+        cursor = MagicMock(description=[('id',)])
+        cursor.fetchmany.return_value = [(1,)]
+        cursor.fetchone.return_value = (2,)  # a row beyond the returned page
+        cursor.nextset.return_value = False
+        mock_connect.return_value = _mock_connection(cursor)
+
+        results = sql_playground.run_sql('_abc123', 'SELECT id FROM tabUser')
+
+        self.assertTrue(results[0]['truncated'])
+
+    @patch('sites.sql_playground.pymysql.connect')
+    @patch('sites.sql_playground.list_databases', return_value=['_abc123'])
+    def test_run_sql_handles_multiple_statements(self, mock_list, mock_connect):
+        cursor = MagicMock(description=None, rowcount=1)
+
+        def nextset_side_effect():
+            if not nextset_side_effect.called:
+                nextset_side_effect.called = True
+                cursor.description = [('id',), ('name',)]
+                cursor.fetchmany.return_value = [(1, 'a')]
+                cursor.fetchone.return_value = None
+                return True
+            return False
+        nextset_side_effect.called = False
+        cursor.nextset.side_effect = nextset_side_effect
+        mock_connect.return_value = _mock_connection(cursor)
+
+        results = sql_playground.run_sql('_abc123', "INSERT INTO t VALUES (1); SELECT id, name FROM t;")
+
+        self.assertEqual(results[0], {'affected_rows': 1})
+        self.assertEqual(results[1]['columns'], ['id', 'name'])
+        self.assertEqual(results[1]['rows'], [[1, 'a']])
+
+    @patch('sites.sql_playground.pymysql.connect')
+    @patch('sites.sql_playground.list_databases', return_value=['_abc123'])
+    def test_run_sql_rolls_back_and_reraises_on_failure(self, mock_list, mock_connect):
+        cursor = MagicMock()
+        cursor.execute.side_effect = pymysql.err.ProgrammingError('syntax error')
+        mock_connect.return_value = _mock_connection(cursor)
+
+        with self.assertRaises(pymysql.err.ProgrammingError):
+            sql_playground.run_sql('_abc123', 'NOT VALID SQL')
+
+        mock_connect.return_value.rollback.assert_called_once()
+        mock_connect.return_value.commit.assert_not_called()
+
+
+class SqlPlaygroundViewTests(APITestCase):
+    def setUp(self):
+        self.admin = get_user_model().objects.create_user(
+            username='admin@example.com', password='s3cret-pass', is_staff=True,
+        )
+        self.member = get_user_model().objects.create_user(
+            username='member@example.com', password='s3cret-pass',
+        )
+
+    def test_non_admin_cannot_list_databases(self):
+        self.client.force_authenticate(user=self.member)
+        response = self.client.get('/api/sql/databases/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_non_admin_cannot_run_queries(self):
+        self.client.force_authenticate(user=self.member)
+        response = self.client.post('/api/sql/query/', {'database': '_abc123', 'sql': 'SELECT 1'})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @patch('sites.views.sql_playground.list_databases', return_value=['_abc123', '_def456'])
+    def test_admin_lists_databases_without_a_matching_site(self, mock_list):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get('/api/sql/databases/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data['databases'],
+            [{'name': '_abc123', 'site': None}, {'name': '_def456', 'site': None}],
+        )
+
+    @patch('sites.views.bench_exec.get_db_name', return_value='_abc123')
+    @patch('sites.views.sql_playground.list_databases', return_value=['_abc123', '_def456'])
+    def test_admin_lists_databases_labelled_with_their_site_hostname(self, mock_list, mock_get_db_name):
+        server = Server.objects.create(name='localhost')
+        bench = Bench.objects.create(server=server, name='bench-a')
+        Site.objects.create(
+            bench=bench, hostname='demo.localhost', admin_password='pw', status=Site.STATUS_ACTIVE,
+        )
+
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.get('/api/sql/databases/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data['databases'],
+            [{'name': '_abc123', 'site': 'demo.localhost'}, {'name': '_def456', 'site': None}],
+        )
+
+    def test_query_requires_database_and_sql(self):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post('/api/sql/query/', {'database': '_abc123'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch('sites.views.sql_playground.run_sql', return_value=[{'affected_rows': 1}])
+    def test_admin_runs_a_query(self, mock_run):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post('/api/sql/query/', {'database': '_abc123', 'sql': 'DELETE FROM t WHERE id=1'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['results'], [{'affected_rows': 1}])
+        mock_run.assert_called_once_with('_abc123', 'DELETE FROM t WHERE id=1')
+
+    @patch('sites.views.sql_playground.run_sql', side_effect=pymysql.err.ProgrammingError('bad sql'))
+    def test_sql_error_is_reported_as_400_not_500(self, mock_run):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post('/api/sql/query/', {'database': '_abc123', 'sql': 'NOT VALID'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('bad sql', response.data['detail'])
+
+    @patch('sites.views.sql_playground.run_sql', side_effect=ValueError('"x" is not a known database.'))
+    def test_unknown_database_is_reported_as_400(self, mock_run):
+        self.client.force_authenticate(user=self.admin)
+        response = self.client.post('/api/sql/query/', {'database': 'x', 'sql': 'SELECT 1'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

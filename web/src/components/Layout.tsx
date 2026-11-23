@@ -32,12 +32,20 @@ export default function Layout({ children }: { children: ReactNode }) {
             </Link>
           ))}
           {user?.is_admin && (
-            <Link
-              to="/users"
-              className="rounded-md px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
-            >
-              Users
-            </Link>
+            <>
+              <Link
+                to="/users"
+                className="rounded-md px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
+              >
+                Users
+              </Link>
+              <Link
+                to="/sql"
+                className="rounded-md px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
+              >
+                SQL Playground
+              </Link>
+            </>
           )}
           <Link
             to="/profile"
