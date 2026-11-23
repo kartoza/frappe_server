@@ -283,10 +283,8 @@ def restore_database_from_upload_task(site_id, job_id, staging_path, original_fi
 
     try:
         job.append_log(f'Restoring database for {site.hostname} from uploaded file...\n')
-        with open(staging_path, 'rb') as f:
-            data = f.read()
         filename = f'restore-{int(time.time())}-{original_filename}'
-        remote_sql_path = bench_exec.stage_uploaded_file(site.bench, data, filename)
+        remote_sql_path = bench_exec.stage_uploaded_file(site.bench, staging_path, filename)
         bench_exec.restore_database(site.bench, site, job, remote_sql_path)
         job.mark_success()
     except Exception as exc:  # noqa: BLE001

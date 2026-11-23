@@ -5,7 +5,9 @@ reloads (``sites.nginx_config``) so there is exactly one place that knows how
 to stream a docker-exec's output.
 """
 import io
+import os
 import tarfile
+import threading
 import time
 import zipfile
 
@@ -117,6 +119,45 @@ def _put_archive(container_name, dest_dir, tar_bytes):
     client = get_client()
     container = client.containers.get(container_name)
     container.put_archive(dest_dir, tar_bytes)
+    run_command(container_name, ['chown', '-R', 'frappe:frappe', dest_dir], user='root')
+
+
+def put_file_streamed(container_name, dest_dir, filename, src_path):
+    """Like :func:`put_bytes`, but streams ``src_path`` off disk instead of
+    loading it into memory first.
+
+    ``put_bytes`` holds the whole payload in memory twice over — once as
+    the caller's ``data`` argument, again inside the in-memory tar it
+    builds — which is fine for a small file like a site_config.json but
+    prohibitively slow and memory-hungry for a multi-gigabyte one (e.g. a
+    database restore dump). This tars ``src_path`` straight off disk into a
+    pipe fed directly to the Docker API as the request body, so the file's
+    bytes are read once and never fully materialized in this process.
+    """
+    read_fd, write_fd = os.pipe()
+    errors = []
+
+    def _feed():
+        try:
+            with os.fdopen(write_fd, 'wb') as write_end:
+                with tarfile.open(fileobj=write_end, mode='w|') as tar:
+                    tar.add(src_path, arcname=filename)
+        except Exception as exc:  # noqa: BLE001 - re-raised on the main thread below
+            errors.append(exc)
+
+    feeder = threading.Thread(target=_feed, daemon=True)
+    feeder.start()
+
+    client = get_client()
+    container = client.containers.get(container_name)
+    try:
+        with os.fdopen(read_fd, 'rb') as read_end:
+            container.put_archive(dest_dir, read_end)
+    finally:
+        feeder.join()
+    if errors:
+        raise errors[0]
+
     run_command(container_name, ['chown', '-R', 'frappe:frappe', dest_dir], user='root')
 
 

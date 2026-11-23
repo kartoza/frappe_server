@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import uuid
@@ -207,101 +208,191 @@ class SiteViewSet(
         toggle_maintenance_task.delay(site.id, enabled, job.id)
         return Response({'job_id': job.id}, status=status.HTTP_202_ACCEPTED)
 
-    @action(detail=True, methods=['post'], url_path='restore-database')
-    def restore_database(self, request, pk=None):
-        """Restore this site's database from an uploaded SQL dump.
+    @action(detail=True, methods=['post'], url_path='upload-chunk')
+    def upload_chunk(self, request, pk=None):
+        """Accept one piece of a chunked restore upload.
 
-        Only written to local scratch space here (fast regardless of size).
-        Transferring it into the bench container is a slow `docker
-        put_archive` call for a multi-gigabyte dump — that, and the actual
-        `bench restore`, run in the Celery task instead, so an upload this
-        size can't tie up a web worker long enough to hit its timeout.
+        Restore uploads (SQL dumps especially) are split into small pieces
+        client-side because this deployment sits behind Cloudflare, which
+        enforces its own request body size limit regardless of anything
+        configured on this server — a single multi-gigabyte request simply
+        never arrives intact. Splitting it into many small requests, each
+        well under that limit, is the only way a dump of arbitrary size
+        gets through at all. See `upload_complete` for reassembly.
         """
-        site = self.get_object()
-        uploaded = request.FILES.get('file')
-        if not uploaded:
-            return Response({'detail': 'file is required.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        os.makedirs(settings.UPLOAD_STAGING_DIR, exist_ok=True)
-        staging_path = os.path.join(settings.UPLOAD_STAGING_DIR, f'{uuid.uuid4()}-{uploaded.name}')
-        with open(staging_path, 'wb') as f:
-            for chunk in uploaded.chunks():
-                f.write(chunk)
-
-        job = Job.objects.create(job_type=Job.TYPE_RESTORE_DATABASE, site=site, bench=site.bench)
-        restore_database_from_upload_task.delay(site.id, job.id, staging_path, uploaded.name)
-        return Response({'job_id': job.id}, status=status.HTTP_202_ACCEPTED)
-
-    @action(detail=True, methods=['post'], url_path='restore-site-config')
-    def restore_site_config(self, request, pk=None):
-        """Overwrite this site's site_config.json with an uploaded file.
-
-        Just a file write (no long-running bench command), so it completes
-        synchronously within the request — still recorded as a Job for a
-        consistent history/audit trail with everything else.
-        """
-        site = self.get_object()
-        uploaded = request.FILES.get('file')
-        if not uploaded:
-            return Response({'detail': 'file is required.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        raw = uploaded.read()
+        self.get_object()  # 404s early; also enforces this view's permissions
         try:
-            json.loads(raw)
-        except ValueError:
-            return Response(
-                {'detail': 'That file is not valid JSON.'}, status=status.HTTP_400_BAD_REQUEST
-            )
+            chunk_dir = _upload_chunk_dir(request.data.get('upload_id'))
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        job = Job.objects.create(job_type=Job.TYPE_RESTORE_SITE_CONFIG, site=site, bench=site.bench)
-        job.mark_running()
+        chunk = request.FILES.get('chunk')
         try:
-            bench_exec.restore_site_config(site.bench, site, raw)
-            job.append_log('site_config.json replaced.\n')
-            job.mark_success()
-        except Exception as exc:  # noqa: BLE001
-            job.mark_failed(str(exc))
-        return Response({'job_id': job.id}, status=status.HTTP_202_ACCEPTED)
-
-    @action(detail=True, methods=['post'], url_path='restore-public-files')
-    def restore_public_files(self, request, pk=None):
-        """Extract an uploaded zip or tar into this site's public/files directory."""
-        return self._restore_files(request, job_type=Job.TYPE_RESTORE_PUBLIC_FILES, is_private=False)
-
-    @action(detail=True, methods=['post'], url_path='restore-private-files')
-    def restore_private_files(self, request, pk=None):
-        """Extract an uploaded zip or tar into this site's private/files directory."""
-        return self._restore_files(request, job_type=Job.TYPE_RESTORE_PRIVATE_FILES, is_private=True)
-
-    def _restore_files(self, request, job_type, is_private):
-        site = self.get_object()
-        uploaded = request.FILES.get('file')
-        if not uploaded:
-            return Response({'detail': 'file is required.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        raw = uploaded.read()
-        if zipfile.is_zipfile(io.BytesIO(raw)):
-            archive_format = 'zip'
-        elif tarfile.is_tarfile(io.BytesIO(raw)):
-            archive_format = 'tar'
-        else:
+            chunk_index = int(request.data.get('chunk_index'))
+        except (TypeError, ValueError):
+            chunk_index = -1
+        if not chunk or chunk_index < 0:
             return Response(
-                {'detail': 'That file is not a valid zip or tar archive.'},
+                {'detail': 'upload_id, a non-negative chunk_index, and chunk are required.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        job = Job.objects.create(job_type=job_type, site=site, bench=site.bench)
-        job.mark_running()
+        os.makedirs(chunk_dir, exist_ok=True)
+        with open(os.path.join(chunk_dir, f'{chunk_index:08d}'), 'wb') as f:
+            for piece in chunk.chunks():
+                f.write(piece)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['get'], url_path='upload-status')
+    def upload_status(self, request, pk=None):
+        """Which chunk indices of `upload_id` have already landed.
+
+        Lets a retried/resumed upload skip whatever already made it
+        through instead of re-sending the entire file from scratch.
+        """
+        self.get_object()
         try:
-            if is_private:
-                bench_exec.restore_private_files(site.bench, site, raw, archive_format)
-            else:
-                bench_exec.restore_public_files(site.bench, site, raw, archive_format)
-            job.append_log('Files extracted (existing files with the same name were overwritten; others left untouched).\n')
-            job.mark_success()
-        except Exception as exc:  # noqa: BLE001
-            job.mark_failed(str(exc))
-        return Response({'job_id': job.id}, status=status.HTTP_202_ACCEPTED)
+            chunk_dir = _upload_chunk_dir(request.query_params.get('upload_id'))
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not os.path.isdir(chunk_dir):
+            return Response({'received': []})
+        received = sorted(int(name) for name in os.listdir(chunk_dir) if name.isdigit())
+        return Response({'received': received})
+
+    @action(detail=True, methods=['post'], url_path='upload-complete')
+    def upload_complete(self, request, pk=None):
+        """Reassemble a chunked upload and dispatch it to the requested restore action.
+
+        Behaves exactly as the single-request restore-* endpoints used to
+        (same Job bookkeeping, same bench_exec calls) — the only
+        difference is the file arrives as many small pieces instead of one
+        request, so it has to be stitched back together first.
+        """
+        site = self.get_object()
+        restore_type = request.data.get('restore_type')
+        finisher = RESTORE_FINISHERS.get(restore_type)
+        if not finisher:
+            return Response({'detail': 'Unknown restore_type.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            chunk_dir = _upload_chunk_dir(request.data.get('upload_id'))
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            total_chunks = int(request.data.get('total_chunks'))
+        except (TypeError, ValueError):
+            return Response({'detail': 'total_chunks must be an integer.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        missing = [
+            i for i in range(total_chunks)
+            if not os.path.exists(os.path.join(chunk_dir, f'{i:08d}'))
+        ]
+        if missing:
+            return Response(
+                {'detail': f'Missing chunk(s) {missing[:5]}{"..." if len(missing) > 5 else ""} '
+                           f'— retry the upload (see upload-status).'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        filename = request.data.get('filename') or 'upload'
+        os.makedirs(settings.UPLOAD_STAGING_DIR, exist_ok=True)
+        final_path = os.path.join(settings.UPLOAD_STAGING_DIR, f'{uuid.uuid4()}-{filename}')
+        with open(final_path, 'wb') as out:
+            for i in range(total_chunks):
+                with open(os.path.join(chunk_dir, f'{i:08d}'), 'rb') as part:
+                    shutil.copyfileobj(part, out)
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+
+        try:
+            # Each finisher owns final_path's cleanup from here (either
+            # immediately after reading it into memory, or — for the
+            # database restore, which hands it to a Celery task instead —
+            # once that task is done with it); nothing left to remove here
+            # even on a validation failure.
+            job_id = finisher(site, final_path, filename)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'job_id': job_id}, status=status.HTTP_202_ACCEPTED)
+
+
+def _upload_chunk_dir(upload_id):
+    """Directory a chunked upload's pieces are staged in.
+
+    `upload_id` is client-generated and arrives as free-form input — it's
+    validated as a genuine UUID (rather than just stripped/escaped) so it
+    can never be used to build a path outside the chunks directory.
+    """
+    try:
+        safe_id = str(uuid.UUID(str(upload_id)))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError('upload_id must be a valid UUID.')
+    return os.path.join(settings.UPLOAD_STAGING_DIR, 'chunks', safe_id)
+
+
+def _finish_restore_database(site, path, filename):
+    """:param path: owned by the Celery task from here — it deletes `path` itself."""
+    job = Job.objects.create(job_type=Job.TYPE_RESTORE_DATABASE, site=site, bench=site.bench)
+    restore_database_from_upload_task.delay(site.id, job.id, path, filename)
+    return job.id
+
+
+def _finish_restore_site_config(site, path, filename):
+    with open(path, 'rb') as f:
+        raw = f.read()
+    os.remove(path)
+    try:
+        json.loads(raw)
+    except ValueError:
+        raise ValueError('That file is not valid JSON.')
+
+    job = Job.objects.create(job_type=Job.TYPE_RESTORE_SITE_CONFIG, site=site, bench=site.bench)
+    job.mark_running()
+    try:
+        bench_exec.restore_site_config(site.bench, site, raw)
+        job.append_log('site_config.json replaced.\n')
+        job.mark_success()
+    except Exception as exc:  # noqa: BLE001
+        job.mark_failed(str(exc))
+    return job.id
+
+
+def _finish_restore_files(site, path, job_type, is_private):
+    with open(path, 'rb') as f:
+        raw = f.read()
+    os.remove(path)
+    if zipfile.is_zipfile(io.BytesIO(raw)):
+        archive_format = 'zip'
+    elif tarfile.is_tarfile(io.BytesIO(raw)):
+        archive_format = 'tar'
+    else:
+        raise ValueError('That file is not a valid zip or tar archive.')
+
+    job = Job.objects.create(job_type=job_type, site=site, bench=site.bench)
+    job.mark_running()
+    try:
+        if is_private:
+            bench_exec.restore_private_files(site.bench, site, raw, archive_format)
+        else:
+            bench_exec.restore_public_files(site.bench, site, raw, archive_format)
+        job.append_log('Files extracted (existing files with the same name were overwritten; others left untouched).\n')
+        job.mark_success()
+    except Exception as exc:  # noqa: BLE001
+        job.mark_failed(str(exc))
+    return job.id
+
+
+RESTORE_FINISHERS = {
+    'restore-database': _finish_restore_database,
+    'restore-site-config': _finish_restore_site_config,
+    'restore-public-files': lambda site, path, filename: _finish_restore_files(
+        site, path, Job.TYPE_RESTORE_PUBLIC_FILES, is_private=False
+    ),
+    'restore-private-files': lambda site, path, filename: _finish_restore_files(
+        site, path, Job.TYPE_RESTORE_PRIVATE_FILES, is_private=True
+    ),
+}
 
 
 class BackupViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):

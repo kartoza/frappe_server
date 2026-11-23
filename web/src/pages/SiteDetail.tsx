@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError, downloadFile, postForm } from '../api/client';
+import { api, ApiError, downloadFile, uploadFileChunked, type UploadProgress } from '../api/client';
 import type { App, Backup, Bench, Job, Site } from '../api/types';
 import JobLogViewer from '../components/JobLogViewer';
 import StatusBadge from '../components/StatusBadge';
@@ -57,6 +57,12 @@ export default function SiteDetail() {
   const [error, setError] = useState('');
   const [restoreFiles, setRestoreFiles] = useState<Record<string, File | null>>({});
   const [restoreSubmitting, setRestoreSubmitting] = useState<string | null>(null);
+  // Bytes sent so far for whichever item is currently submitting — null
+  // before the upload starts/after it ends. Kept as raw loaded/total
+  // (rather than a single rounded percentage) because a whole-percent
+  // rounding hides the first ~20MB of progress on a multi-gigabyte
+  // upload, which reads as "stuck at 0%" even though it's moving.
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
 
   function refreshSite() {
     api.get<Site>(`/sites/${id}/`).then(setSite);
@@ -156,6 +162,25 @@ export default function SiteDetail() {
     await downloadFile(`/backups/${backup.id}/download/`, `${backup.file_path}.tar`);
   }
 
+  async function handleRestoreFromBackup(backup: Backup) {
+    if (
+      !window.confirm(
+        `Restore ${site?.hostname} from the backup taken ${new Date(backup.created_at).toLocaleString()}? This replaces the site's current database and files.`
+      )
+    ) {
+      return;
+    }
+    setError('');
+    try {
+      const result = await api.post<{ job_id: number }>(`/sites/${id}/restore/`, {
+        backup_id: backup.id,
+      });
+      setActiveJobId(result.job_id);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not restore from backup.');
+    }
+  }
+
   async function handleRestoreUpload(item: RestoreItem) {
     const file = restoreFiles[item.key];
     if (!file) return;
@@ -163,16 +188,16 @@ export default function SiteDetail() {
 
     setError('');
     setRestoreSubmitting(item.key);
+    setUploadProgress({ loaded: 0, total: file.size });
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      const result = await postForm<{ job_id: number }>(`/sites/${id}/${item.key}/`, formData);
+      const result = await uploadFileChunked(id!, item.key, file, setUploadProgress);
       setActiveJobId(result.job_id);
       setRestoreFiles((prev) => ({ ...prev, [item.key]: null }));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Restore failed.');
     } finally {
       setRestoreSubmitting(null);
+      setUploadProgress(null);
     }
   }
 
@@ -322,12 +347,20 @@ export default function SiteDetail() {
               <div className="flex items-center gap-3">
                 <StatusBadge status={backup.status} />
                 {backup.status === 'success' && (
-                  <button
-                    onClick={() => handleDownload(backup)}
-                    className="text-sm text-indigo-400 hover:underline"
-                  >
-                    Download
-                  </button>
+                  <>
+                    <button
+                      onClick={() => handleDownload(backup)}
+                      className="text-sm text-indigo-400 hover:underline"
+                    >
+                      Download
+                    </button>
+                    <button
+                      onClick={() => handleRestoreFromBackup(backup)}
+                      className="text-sm text-rose-400 hover:text-rose-300"
+                    >
+                      Restore
+                    </button>
+                  </>
                 )}
               </div>
             </li>
@@ -366,6 +399,26 @@ export default function SiteDetail() {
                   {restoreSubmitting === item.key ? 'Uploading...' : 'Restore'}
                 </button>
               </div>
+              {restoreSubmitting === item.key && uploadProgress !== null && (
+                <div className="mt-3">
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                    <div
+                      className="h-full rounded-full bg-indigo-500 transition-[width]"
+                      style={{
+                        width: `${Math.min(100, (uploadProgress.loaded / uploadProgress.total) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                  {/* One decimal place, plus the raw MB count — a whole-percent
+                      rounding hides all progress for the first ~20MB of a
+                      multi-gigabyte upload, which reads as stuck even when
+                      it isn't. */}
+                  <div className="mt-1 text-xs text-slate-500">
+                    {((uploadProgress.loaded / uploadProgress.total) * 100).toFixed(1)}% uploaded (
+                    {(uploadProgress.loaded / 1024 / 1024).toFixed(1)} MB / {(uploadProgress.total / 1024 / 1024).toFixed(1)} MB)
+                  </div>
+                </div>
+              )}
             </div>
           ))}
         </div>

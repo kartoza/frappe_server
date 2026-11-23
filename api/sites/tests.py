@@ -4,12 +4,13 @@ import io
 import os
 import tarfile
 import tempfile
+import uuid
 import zipfile
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -743,6 +744,14 @@ class SiteRestoreUploadTests(APITestCase):
         self.site = Site.objects.create(
             bench=bench, hostname='demo.localhost', admin_password='pw', status=Site.STATUS_ACTIVE
         )
+        # Every test here writes real chunk/staging files (upload-chunk,
+        # upload-complete) — isolated so they never touch the real shared
+        # UPLOAD_STAGING_DIR volume.
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        override = override_settings(UPLOAD_STAGING_DIR=tmpdir.name)
+        override.enable()
+        self.addCleanup(override.disable)
 
     def _zip_bytes(self):
         buffer = io.BytesIO()
@@ -759,39 +768,92 @@ class SiteRestoreUploadTests(APITestCase):
             tar.addfile(info, io.BytesIO(data))
         return buffer.getvalue()
 
+    def _upload(self, restore_type, filename, data):
+        """Drive the chunked upload-chunk/upload-complete flow as a single
+        chunk — the flow this platform's own chunked uploads use, just
+        with test data small enough to not actually need splitting."""
+        upload_id = str(uuid.uuid4())
+        chunk_response = self.client.post(
+            f'/api/sites/{self.site.id}/upload-chunk/',
+            {
+                'upload_id': upload_id,
+                'chunk_index': '0',
+                'chunk': SimpleUploadedFile('chunk', data),
+            },
+        )
+        self.assertEqual(chunk_response.status_code, status.HTTP_204_NO_CONTENT)
+        return self.client.post(
+            f'/api/sites/{self.site.id}/upload-complete/',
+            {
+                'upload_id': upload_id,
+                'total_chunks': '1',
+                'filename': filename,
+                'restore_type': restore_type,
+            },
+        )
+
     @patch('sites.views.restore_database_from_upload_task')
-    def test_restore_database_writes_to_local_scratch_and_enqueues_job(self, mock_task):
+    def test_restore_database_reassembles_and_enqueues_job(self, mock_task):
         """Staging into the bench container must not happen inline (see
         tasks.restore_database_from_upload_task) — a slow docker call done
         synchronously here previously tripped gunicorn's worker timeout on
-        large dumps. The view's only job now is a fast local write."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with self.settings(UPLOAD_STAGING_DIR=tmpdir):
-                upload = SimpleUploadedFile('dump.sql', b'-- sql dump', content_type='application/sql')
-                response = self.client.post(
-                    f'/api/sites/{self.site.id}/restore-database/', {'file': upload}
-                )
+        large dumps. upload-complete's only job is reassembly + a fast
+        local write."""
+        response = self._upload('restore-database', 'dump.sql', b'-- sql dump')
 
-                self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-                mock_task.delay.assert_called_once()
-                call_args = mock_task.delay.call_args[0]
-                self.assertEqual(call_args[0], self.site.id)
-                self.assertEqual(call_args[1], response.data['job_id'])
-                staging_path = call_args[2]
-                self.assertEqual(call_args[3], 'dump.sql')
-                with open(staging_path, 'rb') as f:
-                    self.assertEqual(f.read(), b'-- sql dump')
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mock_task.delay.assert_called_once()
+        call_args = mock_task.delay.call_args[0]
+        self.assertEqual(call_args[0], self.site.id)
+        self.assertEqual(call_args[1], response.data['job_id'])
+        staging_path = call_args[2]
+        self.assertEqual(call_args[3], 'dump.sql')
+        with open(staging_path, 'rb') as f:
+            self.assertEqual(f.read(), b'-- sql dump')
 
-    def test_restore_database_requires_file(self):
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-database/', {})
+    def test_upload_complete_rejects_unknown_restore_type(self):
+        response = self._upload('restore-nonsense', 'dump.sql', b'-- sql dump')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_upload_complete_rejects_missing_chunks(self):
+        response = self.client.post(
+            f'/api/sites/{self.site.id}/upload-complete/',
+            {
+                'upload_id': str(uuid.uuid4()),
+                'total_chunks': '3',
+                'filename': 'dump.sql',
+                'restore_type': 'restore-database',
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_upload_status_reports_received_chunks(self):
+        upload_id = str(uuid.uuid4())
+        self.client.post(
+            f'/api/sites/{self.site.id}/upload-chunk/',
+            {'upload_id': upload_id, 'chunk_index': '2', 'chunk': SimpleUploadedFile('chunk', b'abc')},
+        )
+        response = self.client.get(f'/api/sites/{self.site.id}/upload-status/?upload_id={upload_id}')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['received'], [2])
+
+    def test_upload_status_unknown_upload_id_reports_empty(self):
+        response = self.client.get(
+            f'/api/sites/{self.site.id}/upload-status/?upload_id={uuid.uuid4()}'
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['received'], [])
+
+    def test_upload_chunk_rejects_non_uuid_upload_id(self):
+        response = self.client.post(
+            f'/api/sites/{self.site.id}/upload-chunk/',
+            {'upload_id': '../../etc', 'chunk_index': '0', 'chunk': SimpleUploadedFile('chunk', b'x')},
+        )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     @patch('sites.bench_exec.restore_site_config')
     def test_restore_site_config_accepts_valid_json(self, mock_restore):
-        upload = SimpleUploadedFile(
-            'site_config.json', b'{"db_name": "x"}', content_type='application/json'
-        )
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-site-config/', {'file': upload})
+        response = self._upload('restore-site-config', 'site_config.json', b'{"db_name": "x"}')
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_restore.assert_called_once()
@@ -799,14 +861,12 @@ class SiteRestoreUploadTests(APITestCase):
         self.assertEqual(job.status, Job.STATUS_SUCCESS)
 
     def test_restore_site_config_rejects_invalid_json(self):
-        upload = SimpleUploadedFile('site_config.json', b'not json', content_type='application/json')
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-site-config/', {'file': upload})
+        response = self._upload('restore-site-config', 'site_config.json', b'not json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     @patch('sites.bench_exec.restore_public_files')
     def test_restore_public_files_accepts_valid_zip(self, mock_restore):
-        upload = SimpleUploadedFile('files.zip', self._zip_bytes(), content_type='application/zip')
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-public-files/', {'file': upload})
+        response = self._upload('restore-public-files', 'files.zip', self._zip_bytes())
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_restore.assert_called_once_with(self.site.bench, self.site, self._zip_bytes(), 'zip')
@@ -815,8 +875,7 @@ class SiteRestoreUploadTests(APITestCase):
 
     @patch('sites.bench_exec.restore_private_files')
     def test_restore_private_files_accepts_valid_zip(self, mock_restore):
-        upload = SimpleUploadedFile('files.zip', self._zip_bytes(), content_type='application/zip')
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-private-files/', {'file': upload})
+        response = self._upload('restore-private-files', 'files.zip', self._zip_bytes())
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_restore.assert_called_once_with(self.site.bench, self.site, self._zip_bytes(), 'zip')
@@ -825,23 +884,20 @@ class SiteRestoreUploadTests(APITestCase):
 
     @patch('sites.bench_exec.restore_public_files')
     def test_restore_public_files_accepts_valid_tar(self, mock_restore):
-        upload = SimpleUploadedFile('files.tar', self._tar_bytes(), content_type='application/x-tar')
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-public-files/', {'file': upload})
+        response = self._upload('restore-public-files', 'files.tar', self._tar_bytes())
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_restore.assert_called_once_with(self.site.bench, self.site, self._tar_bytes(), 'tar')
 
     @patch('sites.bench_exec.restore_private_files')
     def test_restore_private_files_accepts_valid_tar(self, mock_restore):
-        upload = SimpleUploadedFile('files.tar', self._tar_bytes(), content_type='application/x-tar')
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-private-files/', {'file': upload})
+        response = self._upload('restore-private-files', 'files.tar', self._tar_bytes())
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_restore.assert_called_once_with(self.site.bench, self.site, self._tar_bytes(), 'tar')
 
     def test_restore_public_files_rejects_neither_zip_nor_tar(self):
-        upload = SimpleUploadedFile('files.zip', b'not a zip or tar', content_type='application/zip')
-        response = self.client.post(f'/api/sites/{self.site.id}/restore-public-files/', {'file': upload})
+        response = self._upload('restore-public-files', 'files.zip', b'not a zip or tar')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
@@ -874,7 +930,7 @@ class RestoreDatabaseTaskTests(TestCase):
         mock_stage.assert_called_once()
         stage_args = mock_stage.call_args[0]
         self.assertEqual(stage_args[0], self.bench)
-        self.assertEqual(stage_args[1], b'-- sql dump')
+        self.assertEqual(stage_args[1], staging_path)
         self.assertTrue(stage_args[2].endswith('dump.sql'))
         mock_restore.assert_called_once_with(self.bench, self.site, self.job, '/bench/uploads/restore.sql')
         self.job.refresh_from_db()

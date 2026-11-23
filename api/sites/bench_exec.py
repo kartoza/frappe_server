@@ -215,19 +215,22 @@ def list_backups(bench, site):
     return [line for line in output.splitlines() if line.strip()]
 
 
-def stage_uploaded_file(bench, data, filename):
-    """Place an uploaded file into the bench's shared uploads/ dir.
+def stage_uploaded_file(bench, src_path, filename):
+    """Place a file already on local disk into the bench's shared uploads/ dir.
 
     Lets an HTTP-uploaded file reach a `bench` CLI command that expects a
     path on disk inside the container — there's no shared filesystem
-    between the API and a bench container otherwise.
+    between the API and a bench container otherwise. Streams ``src_path``
+    straight off disk (see ``put_file_streamed``) rather than loading it
+    into memory first — this is the path a multi-gigabyte database restore
+    dump takes.
 
     :returns: The file's path inside the container.
     :rtype: str
     """
     staging_dir = f'{bench.bench_path}/uploads'
     run_command(bench.container_name, ['mkdir', '-p', staging_dir], user=BENCH_USER)
-    container_exec.put_bytes(bench.container_name, staging_dir, filename, data)
+    container_exec.put_file_streamed(bench.container_name, staging_dir, filename, src_path)
     return f'{staging_dir}/{filename}'
 
 

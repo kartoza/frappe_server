@@ -172,6 +172,13 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 # for a multi-gigabyte dump.
 UPLOAD_STAGING_DIR = os.environ.get('UPLOAD_STAGING_DIR', '/app/upload_staging')
 
+# Point Django's own upload-handling temp files at the same volume as
+# UPLOAD_STAGING_DIR (rather than the container's default, usually /tmp) so
+# the view can move the file into place with a simple rename instead of
+# another full-file copy — the difference between an instant op and a
+# multi-minute one for a multi-gigabyte dump.
+FILE_UPLOAD_TEMP_DIR = UPLOAD_STAGING_DIR
+
 # --- Email (invite delivery) ---
 # Defaults to logging emails to the worker's console rather than sending
 # them — the admin always gets the invite link back from the API response
