@@ -16,6 +16,7 @@ export default function NewSiteWizard() {
   const [selectedApps, setSelectedApps] = useState<number[]>([]);
   const [jobId, setJobId] = useState<number | null>(null);
   const [error, setError] = useState('');
+  const [allowedDomains, setAllowedDomains] = useState<string[]>([]);
 
   useEffect(() => {
     api.get<Bench[]>('/benches/').then((data) => {
@@ -27,6 +28,9 @@ export default function NewSiteWizard() {
         if (active) setBenchId(active.id);
       }
     });
+    api.get<{ domains: string[] }>('/sites/allowed-domains/').then((data) =>
+      setAllowedDomains(data.domains)
+    );
   }, [lockedBenchId]);
 
   // Only apps already fetched onto the chosen bench are installable — a
@@ -109,6 +113,11 @@ export default function NewSiteWizard() {
               onChange={(e) => setHostname(e.target.value)}
               required
             />
+            {allowedDomains.length > 0 && (
+              <p className="mt-1 text-xs text-slate-500">
+                Must be, or be a subdomain of: {allowedDomains.join(', ')}
+              </p>
+            )}
           </div>
 
           <div>

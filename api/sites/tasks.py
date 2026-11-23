@@ -294,3 +294,20 @@ def restore_database_from_upload_task(site_id, job_id, staging_path, original_fi
     finally:
         if os.path.exists(staging_path):
             os.remove(staging_path)
+
+
+@shared_task
+def renew_ssl_certs_task():
+    """Periodic (see platform_api/celery.py beat schedule): keep every
+    eligible site's certificate issued and renewed.
+
+    Not tracked as a Job — this runs unattended on a schedule rather than
+    in response to an operator action, so there's no site/bench to
+    attach a Job to and no one watching a log viewer for it. Failures are
+    only logged (see sites.ssl.issue_or_renew) since a domain that isn't
+    pointed here yet, or has hit a rate limit, is expected to fail
+    silently until the next scheduled attempt — it must never raise and
+    take the whole beat schedule down with it.
+    """
+    from . import ssl as ssl_module
+    ssl_module.run_for_all_eligible_sites()

@@ -116,6 +116,41 @@ PLATFORM_ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
 NGINX_CONF_DIR = os.environ.get('NGINX_CONF_DIR', '/nginx_conf')
 PROXY_CONTAINER_NAME = os.environ.get('PROXY_CONTAINER_NAME', 'frappe-platform-proxy')
 
+# Domains a site's hostname is allowed to use (exact match or any
+# subdomain of one) — nginx itself will happily create a server block for
+# whatever hostname a site is given, so this is the actual gate against
+# someone fat-fingering (or deliberately entering) a domain the operator
+# doesn't control. "localhost" alone covers every site created with the
+# platform's own dev convention (e.g. "demo.localhost"); add real domains
+# here (comma separated) once they're ready to host a site, e.g.
+# ALLOWED_SITE_DOMAINS=localhost,kartoza.com
+ALLOWED_SITE_DOMAINS = [
+    domain.strip().lower()
+    for domain in os.environ.get('ALLOWED_SITE_DOMAINS', 'localhost').split(',')
+    if domain.strip()
+]
+
+# --- SSL (Let's Encrypt via certbot) ---
+# Off by default: issuing a real certificate requires the domain's public
+# DNS to actually point at this host with port 80 reachable from the
+# internet (for the HTTP-01 challenge) — true for a real custom domain,
+# never true for "localhost" dev sites. Flip this on only once a real
+# domain has been added to ALLOWED_SITE_DOMAINS and its DNS is live.
+SSL_ENABLED = os.environ.get('SSL_ENABLED', '0') == '1'
+# Let's Encrypt's staging API has near-unlimited rate limits but issues
+# certs no browser trusts — use it while testing this feature itself so a
+# mistake doesn't burn into the production API's much stricter limits.
+SSL_STAGING = os.environ.get('SSL_STAGING', '0') == '1'
+SSL_CONTACT_EMAIL = os.environ.get('SSL_CONTACT_EMAIL', PLATFORM_ADMIN_EMAIL)
+# Shared volumes, also mounted into the proxy container (see
+# docker-compose.yml) — nginx needs to read issued certs and serve ACME
+# HTTP-01 challenge files from the exact paths certbot writes them to.
+SSL_CERT_DIR = os.environ.get('SSL_CERT_DIR', '/etc/letsencrypt')
+SSL_WEBROOT_DIR = os.environ.get('SSL_WEBROOT_DIR', '/var/www/certbot')
+# "localhost" can never get a real certificate (not a public domain), so
+# it's always excluded from SSL automation regardless of ALLOWED_SITE_DOMAINS.
+SSL_EXCLUDED_DOMAINS = {'localhost'}
+
 # Maximum number of characters of command output kept inline on a Job row
 # before older lines are dropped (full output is written to a log file on
 # the relevant bench's volume instead).

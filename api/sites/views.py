@@ -7,16 +7,19 @@ import tarfile
 import uuid
 import zipfile
 
+import pymysql
 from django.conf import settings
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from benches.container_exec import get_client
 
-from . import bench_exec
+from . import bench_exec, sql_playground
 from .models import App, Backup, Job, Site, SiteApp
 from .serializers import AppSerializer, BackupSerializer, JobSerializer, SiteSerializer
 from .tasks import (
@@ -121,6 +124,11 @@ class SiteViewSet(
         job = Job.objects.create(job_type=Job.TYPE_SITE_DELETE, site=site, bench=site.bench)
         delete_site_task.delay(site.id, job.id)
         return Response({'job_id': job.id}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=False, methods=['get'], url_path='allowed-domains')
+    def allowed_domains(self, request):
+        """Domains (see settings.ALLOWED_SITE_DOMAINS) a new site's hostname must fall under."""
+        return Response({'domains': settings.ALLOWED_SITE_DOMAINS})
 
     @action(detail=True, methods=['post'], url_path='install-app')
     def install_app(self, request, pk=None):
@@ -341,3 +349,54 @@ class JobViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.Gene
         if bench_id:
             queryset = queryset.filter(bench_id=bench_id)
         return queryset
+
+
+class SqlDatabasesView(APIView):
+    """List the databases the SQL playground can target — admin-only.
+
+    Each is labelled with the site hostname it belongs to where known
+    (read from that site's own site_config.json — nothing on the ``Site``
+    row itself records its db name, Frappe derives it from a hash of the
+    site name at creation time).
+    """
+
+    permission_classes = (IsAdminUser,)
+
+    def get(self, request):
+        db_names = sql_playground.list_databases()
+
+        hostname_by_db = {}
+        active_sites = Site.objects.filter(status=Site.STATUS_ACTIVE).select_related('bench')
+        for site in active_sites:
+            db_name = bench_exec.get_db_name(site.bench, site)
+            if db_name:
+                hostname_by_db[db_name] = site.hostname
+
+        databases = [{'name': name, 'site': hostname_by_db.get(name)} for name in db_names]
+        return Response({'databases': databases})
+
+
+class SqlQueryView(APIView):
+    """Run arbitrary SQL against a chosen database — admin-only.
+
+    Full read/write access, deliberately: this is a power tool for an
+    admin who already has host-level reach via the docker.sock mount
+    (see benches/container_exec.py), not a scoped, validated input form.
+    """
+
+    permission_classes = (IsAdminUser,)
+
+    def post(self, request):
+        database = request.data.get('database')
+        sql = request.data.get('sql')
+        if not database or not sql:
+            return Response(
+                {'detail': 'database and sql are both required.'}, status=status.HTTP_400_BAD_REQUEST
+            )
+        try:
+            results = sql_playground.run_sql(database, sql)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except pymysql.Error as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'results': results})
