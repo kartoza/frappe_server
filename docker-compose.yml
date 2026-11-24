@@ -121,8 +121,8 @@ services:
     # for nginx's entrypoint to envsubst into nginx.conf at boot.
     env_file: .env
     ports:
-      - "82:80"
-      - "445:443"
+      - "80:80"
+      - "443:443"
     volumes:
       - nginx_conf:/etc/nginx/conf.d/sites
       - ssl_certs:/etc/letsencrypt:ro
