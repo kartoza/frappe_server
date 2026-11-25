@@ -46,6 +46,15 @@ services:
       # attachment blobs — `bench restore` fails mid-way with "Server has
       # gone away" / "Got a packet bigger than 'max_allowed_packet' bytes".
       - --max_allowed_packet=512M
+      # Defaults (30s/60s) are tuned for interactive queries, not a
+      # mariadb-dump streaming a whole site's database — under any host
+      # load (swapping, disk contention, a slow docker-exec'd client), the
+      # dump can stall mid-table for longer than that and the server
+      # aborts it: "Lost connection to server during query when dumping
+      # table ... at row N". 10 minutes tolerates real-world host hiccups
+      # without masking a genuinely dead connection forever.
+      - --net_read_timeout=600
+      - --net_write_timeout=600
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
     volumes:
