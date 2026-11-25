@@ -1,11 +1,11 @@
-import { useEffect, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError, downloadFile, uploadFileChunked, type UploadProgress } from '../api/client';
 import type { App, Backup, Bench, Job, Site } from '../api/types';
 import JobLogViewer from '../components/JobLogViewer';
 import StatusBadge from '../components/StatusBadge';
 
-type Tab = 'overview' | 'apps' | 'backups' | 'jobs' | 'restore';
+type Tab = 'overview' | 'apps' | 'domains' | 'config' | 'backups' | 'jobs' | 'restore';
 
 interface RestoreItem {
   key: string;
@@ -63,12 +63,26 @@ export default function SiteDetail() {
   // rounding hides the first ~20MB of progress on a multi-gigabyte
   // upload, which reads as "stuck at 0%" even though it's moving.
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+  const [newDomain, setNewDomain] = useState('');
+  const [allowedDomains, setAllowedDomains] = useState<string[]>([]);
+  const [domainSubmitting, setDomainSubmitting] = useState(false);
+  const [configText, setConfigText] = useState('');
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configSaving, setConfigSaving] = useState(false);
+  const [configError, setConfigError] = useState('');
+  const [configMessage, setConfigMessage] = useState('');
 
   function refreshSite() {
     api.get<Site>(`/sites/${id}/`).then(setSite);
   }
 
   useEffect(refreshSite, [id]);
+
+  useEffect(() => {
+    api.get<{ domains: string[] }>('/sites/allowed-domains/').then((data) =>
+      setAllowedDomains(data.domains)
+    );
+  }, []);
 
   // Only apps already fetched onto this site's bench are installable — the
   // backend enforces this too, but filtering here avoids offering an
@@ -88,7 +102,57 @@ export default function SiteDetail() {
     if (tab === 'jobs') {
       api.get<Job[]>(`/jobs/?site=${id}`).then(setJobs);
     }
+    if (tab === 'config') {
+      loadConfig();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, id]);
+
+  async function loadConfig() {
+    setConfigError('');
+    setConfigMessage('');
+    setConfigLoading(true);
+    try {
+      const config = await api.get<Record<string, unknown>>(`/sites/${id}/site-config/`);
+      setConfigText(JSON.stringify(config, null, 1));
+    } catch (err) {
+      setConfigError(err instanceof ApiError ? err.message : 'Could not load site_config.json.');
+    } finally {
+      setConfigLoading(false);
+    }
+  }
+
+  async function handleSaveConfig() {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(configText);
+    } catch {
+      setConfigError('Not valid JSON.');
+      return;
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      setConfigError('Must be a JSON object.');
+      return;
+    }
+    if (
+      !window.confirm(
+        'Overwrite this site’s site_config.json with the edited content? This takes effect immediately.'
+      )
+    ) {
+      return;
+    }
+    setConfigError('');
+    setConfigMessage('');
+    setConfigSaving(true);
+    try {
+      await api.put(`/sites/${id}/site-config/`, parsed);
+      setConfigMessage('Saved.');
+    } catch (err) {
+      setConfigError(err instanceof ApiError ? err.message : 'Could not save site_config.json.');
+    } finally {
+      setConfigSaving(false);
+    }
+  }
 
   async function handleBackup() {
     const result = await api.post<{ job_id: number }>(`/sites/${id}/backup/`);
@@ -107,6 +171,43 @@ export default function SiteDetail() {
     });
     setActiveJobId(result.job_id);
     refreshSite();
+  }
+
+  async function handleAddDomain(event: FormEvent) {
+    event.preventDefault();
+    if (!newDomain.trim()) return;
+    setError('');
+    setDomainSubmitting(true);
+    try {
+      await api.post('/site-domains/', { site: id, domain: newDomain.trim() });
+      setNewDomain('');
+      refreshSite();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not add domain.');
+    } finally {
+      setDomainSubmitting(false);
+    }
+  }
+
+  async function handleRemoveDomain(domainId: number, domain: string) {
+    if (!window.confirm(`Remove ${domain} from this site?`)) return;
+    setError('');
+    try {
+      await api.delete(`/site-domains/${domainId}/`);
+      refreshSite();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not remove domain.');
+    }
+  }
+
+  async function handleSetDefaultDomain(domain: string) {
+    setError('');
+    try {
+      await api.post(`/sites/${id}/set-default-domain/`, { domain });
+      refreshSite();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not set default domain.');
+    }
   }
 
   async function handleDeleteSite() {
@@ -211,8 +312,11 @@ export default function SiteDetail() {
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">{site.hostname}</h1>
+          {site.default_domain !== site.hostname && (
+            <div className="text-sm text-slate-500">Serving as {site.default_domain}</div>
+          )}
           <a
-            href={`http://${site.hostname}/`}
+            href={`http://${site.default_domain}/`}
             target="_blank"
             rel="noreferrer"
             className="text-sm text-indigo-400 hover:underline"
@@ -232,7 +336,7 @@ export default function SiteDetail() {
       </div>
 
       <div className="mb-6 flex gap-2 border-b border-slate-800">
-        {(['overview', 'apps', 'backups', 'restore', 'jobs'] as Tab[]).map((t) => (
+        {(['overview', 'apps', 'domains', 'config', 'backups', 'restore', 'jobs'] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -326,6 +430,131 @@ export default function SiteDetail() {
                 ))}
               </ul>
             </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'domains' && (
+        <div className="space-y-6">
+          <div>
+            <h2 className="mb-2 text-sm font-medium text-slate-400">Domains</h2>
+            <p className="mb-3 text-xs text-slate-500">
+              The default domain is the one that actually serves this site; every other
+              domain redirects there.
+            </p>
+            <ul className="space-y-2">
+              <li className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-900 px-4 py-2">
+                <span>
+                  {site.hostname}
+                  <span className="ml-2 text-xs text-slate-500">(site identity, can&apos;t be removed)</span>
+                </span>
+                {site.default_domain === site.hostname ? (
+                  <span className="text-xs text-emerald-400">Default</span>
+                ) : (
+                  <button
+                    onClick={() => handleSetDefaultDomain(site.hostname)}
+                    className="text-sm text-indigo-400 hover:underline"
+                  >
+                    Set as default
+                  </button>
+                )}
+              </li>
+              {site.domains.map((d) => (
+                <li
+                  key={d.id}
+                  className="flex items-center justify-between rounded-md border border-slate-800 bg-slate-900 px-4 py-2"
+                >
+                  {d.domain}
+                  <div className="flex items-center gap-3">
+                    {d.is_default ? (
+                      <span className="text-xs text-emerald-400">Default</span>
+                    ) : (
+                      <button
+                        onClick={() => handleSetDefaultDomain(d.domain)}
+                        className="text-sm text-indigo-400 hover:underline"
+                      >
+                        Set as default
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleRemoveDomain(d.id, d.domain)}
+                      className="text-sm text-rose-400 hover:text-rose-300"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div>
+            <h2 className="mb-2 text-sm font-medium text-slate-400">Add a domain</h2>
+            <form onSubmit={handleAddDomain} className="flex items-end gap-3">
+              <div>
+                <input
+                  className="w-64 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100"
+                  placeholder="shop.kartoza.com"
+                  value={newDomain}
+                  onChange={(e) => setNewDomain(e.target.value)}
+                  required
+                />
+                {allowedDomains.length > 0 && (
+                  <p className="mt-1 text-xs text-slate-500">
+                    Must be, or be a subdomain of: {allowedDomains.join(', ')}
+                  </p>
+                )}
+              </div>
+              <button
+                type="submit"
+                disabled={domainSubmitting}
+                className="rounded-md bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-400 disabled:opacity-50"
+              >
+                {domainSubmitting ? 'Adding...' : 'Add domain'}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {tab === 'config' && (
+        <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <p className="text-sm text-slate-500">
+              Edit this site&apos;s site_config.json directly. Saving overwrites the file
+              immediately — there is no undo beyond restoring from a backup.
+            </p>
+            <button
+              onClick={loadConfig}
+              disabled={configLoading}
+              className="shrink-0 rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+            >
+              Reload
+            </button>
+          </div>
+
+          {configError && <p className="mb-3 text-sm text-rose-400">{configError}</p>}
+          {configMessage && <p className="mb-3 text-sm text-emerald-400">{configMessage}</p>}
+
+          {configLoading ? (
+            <p className="text-sm text-slate-400">Loading...</p>
+          ) : (
+            <>
+              <textarea
+                className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100"
+                rows={16}
+                value={configText}
+                onChange={(e) => setConfigText(e.target.value)}
+                spellCheck={false}
+              />
+              <button
+                onClick={handleSaveConfig}
+                disabled={configSaving}
+                className="mt-3 rounded-md bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-400 disabled:opacity-50"
+              >
+                {configSaving ? 'Saving...' : 'Save'}
+              </button>
+            </>
           )}
         </div>
       )}

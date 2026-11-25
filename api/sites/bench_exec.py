@@ -253,6 +253,27 @@ def restore_site_config(bench, site, data):
     container_exec.put_bytes(bench.container_name, target_dir, 'site_config.json', data)
 
 
+def read_site_config(bench, site):
+    """Return a site's current site_config.json, parsed.
+
+    Raises RuntimeError if the file can't be read or isn't valid JSON —
+    both are genuinely exceptional here (the file is always written by
+    `bench new-site` itself), unlike `get_db_name`'s silent None, which
+    exists for the SQL playground's merely-cosmetic domain labelling.
+    """
+    exit_code, output = run_command(
+        bench.container_name,
+        ['cat', f'{bench.bench_path}/sites/{site.hostname}/site_config.json'],
+        user=BENCH_USER,
+    )
+    if exit_code != 0:
+        raise RuntimeError(f'Could not read site_config.json: {output}')
+    try:
+        return json.loads(output)
+    except ValueError as exc:
+        raise RuntimeError(f'site_config.json is not valid JSON: {exc}') from exc
+
+
 def get_db_name(bench, site):
     """Read a site's own db_name out of its site_config.json, or None.
 

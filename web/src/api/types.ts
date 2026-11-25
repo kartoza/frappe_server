@@ -40,6 +40,14 @@ export interface SiteApp {
   installed_at: string;
 }
 
+export interface SiteDomain {
+  id: number;
+  site: number;
+  domain: string;
+  is_default: boolean;
+  created_at: string;
+}
+
 export interface Site {
   id: number;
   bench: number;
@@ -49,6 +57,11 @@ export interface Site {
   error_message: string;
   created_at: string;
   installed_apps: SiteApp[];
+  // Custom domains layered on top of `hostname` (which is fixed forever —
+  // it's the real site folder name) — see `default_domain` for which one
+  // actually serves content; every other domain just redirects there.
+  domains: SiteDomain[];
+  default_domain: string;
 }
 
 export interface Backup {

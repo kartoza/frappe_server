@@ -22,7 +22,10 @@ logger = logging.getLogger(__name__)
 
 
 def eligible_hostnames():
-    """Active site hostnames that could plausibly get a real certificate.
+    """Every domain an active site answers to that could plausibly get a
+    real certificate — its own hostname plus any custom domains (see
+    SiteDomain), since each domain terminates its own TLS and so needs
+    its own cert regardless of which one is that site's default.
 
     Excludes anything under settings.SSL_EXCLUDED_DOMAINS (just
     "localhost" by default) — those domains have no public DNS, so
@@ -30,11 +33,15 @@ def eligible_hostnames():
     """
     from .models import Site
 
-    hostnames = Site.objects.filter(status=Site.STATUS_ACTIVE).values_list('hostname', flat=True)
+    all_domains = [
+        domain
+        for site in Site.objects.filter(status=Site.STATUS_ACTIVE).prefetch_related('domains')
+        for domain in site.all_domains
+    ]
     return [
-        hostname for hostname in hostnames
+        domain for domain in all_domains
         if not any(
-            hostname == excluded or hostname.endswith(f'.{excluded}')
+            domain == excluded or domain.endswith(f'.{excluded}')
             for excluded in settings.SSL_EXCLUDED_DOMAINS
         )
     ]

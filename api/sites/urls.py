@@ -5,6 +5,7 @@ from .views import (
     AppViewSet,
     BackupViewSet,
     JobViewSet,
+    SiteDomainViewSet,
     SiteViewSet,
     SqlDatabasesView,
     SqlQueryView,
@@ -13,6 +14,7 @@ from .views import (
 router = DefaultRouter()
 router.register('apps', AppViewSet, basename='app')
 router.register('sites', SiteViewSet, basename='site')
+router.register('site-domains', SiteDomainViewSet, basename='site-domain')
 router.register('backups', BackupViewSet, basename='backup')
 router.register('jobs', JobViewSet, basename='job')
 

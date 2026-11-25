@@ -309,3 +309,16 @@ def renew_ssl_certs_task():
     """
     from . import ssl as ssl_module
     ssl_module.run_for_all_eligible_sites()
+
+
+@shared_task
+def regenerate_nginx_task():
+    """Rewrite and reload the proxy's per-site nginx config.
+
+    A plain wrapper so views (running in the `api` container, which
+    doesn't have the nginx_conf volume mounted — only `worker` and
+    `proxy` do) can trigger a regen without doing the file write inline.
+    Not tracked as a Job: it's a near-instant, side-effect-only
+    operation with nothing meaningful to show progress for.
+    """
+    nginx_config.regenerate_and_reload()

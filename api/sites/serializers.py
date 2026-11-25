@@ -1,7 +1,7 @@
 from django.conf import settings
 from rest_framework import serializers
 
-from .models import App, Backup, BenchApp, Job, Site, SiteApp, is_hostname_allowed
+from .models import App, Backup, BenchApp, Job, Site, SiteApp, SiteDomain, is_hostname_allowed
 
 
 class AppSerializer(serializers.ModelSerializer):
@@ -27,8 +27,34 @@ class BenchAppSerializer(serializers.ModelSerializer):
         fields = ('id', 'app', 'branch', 'fetched_at')
 
 
+class SiteDomainSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SiteDomain
+        fields = ('id', 'site', 'domain', 'is_default', 'created_at')
+        read_only_fields = ('is_default', 'created_at')
+
+    def validate_domain(self, value):
+        """Same whitelist as a site's own hostname, plus global uniqueness.
+
+        The model's own ``unique=True`` on ``domain`` already rules out a
+        clash with another custom domain; this adds the cross-table check
+        against every site's actual hostname, which that constraint can't see.
+        """
+        value = value.lower()
+        if not is_hostname_allowed(value):
+            allowed = ', '.join(settings.ALLOWED_SITE_DOMAINS)
+            raise serializers.ValidationError(
+                f'"{value}" is not under an allowed domain. Allowed: {allowed}.'
+            )
+        if Site.objects.filter(hostname=value).exists():
+            raise serializers.ValidationError(f'"{value}" is already in use by another site.')
+        return value
+
+
 class SiteSerializer(serializers.ModelSerializer):
     installed_apps = SiteAppSerializer(many=True, read_only=True)
+    domains = SiteDomainSerializer(many=True, read_only=True)
+    default_domain = serializers.ReadOnlyField()
     app_ids = serializers.PrimaryKeyRelatedField(
         queryset=App.objects.all(), many=True, write_only=True, required=False
     )
@@ -38,11 +64,11 @@ class SiteSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'bench', 'hostname', 'status', 'maintenance_mode',
             'error_message', 'created_at', 'installed_apps', 'app_ids',
-            'admin_password',
+            'admin_password', 'domains', 'default_domain',
         )
         read_only_fields = (
             'status', 'maintenance_mode', 'error_message', 'created_at',
-            'installed_apps',
+            'installed_apps', 'domains', 'default_domain',
         )
         extra_kwargs = {'admin_password': {'write_only': True}}
 
@@ -58,6 +84,8 @@ class SiteSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 f'"{value}" is not under an allowed domain. Allowed: {allowed}.'
             )
+        if SiteDomain.objects.filter(domain=value.lower()).exists():
+            raise serializers.ValidationError(f'"{value}" is already in use as another site\'s custom domain.')
         return value
 
     def validate(self, attrs):

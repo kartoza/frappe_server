@@ -88,6 +88,58 @@ class Site(models.Model):
         self.hostname = self.hostname.lower()
         super().save(*args, **kwargs)
 
+    @property
+    def default_domain(self):
+        """The domain that should actually serve this site's content.
+
+        Defaults to the site's own (immutable) hostname until an operator
+        explicitly marks a custom domain as default — every other domain
+        this site answers to just redirects here (see nginx_config.py).
+        """
+        default = self.domains.filter(is_default=True).first()
+        return default.domain if default else self.hostname
+
+    @property
+    def all_domains(self):
+        """Every hostname this site answers to: its own plus any custom domains."""
+        return [self.hostname, *self.domains.values_list('domain', flat=True)]
+
+
+class SiteDomain(models.Model):
+    """An additional custom domain (CNAME) pointed at a site.
+
+    The site's own ``hostname`` is fixed at creation time (it's literally
+    the folder/db name Frappe uses on disk) and is never represented as a
+    row here — this table only holds *extra* domains layered on top of
+    that, any one of which can be marked the default (see
+    ``Site.default_domain``) without touching the real hostname at all.
+    """
+
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name='domains')
+    domain = models.CharField(max_length=255, unique=True)
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            # Partial unique index: at most one default per site, but any
+            # number of non-default ones (a plain unique_together on
+            # (site, is_default) would also forbid a second *non*-default
+            # domain on the same site).
+            models.UniqueConstraint(
+                fields=['site'], condition=models.Q(is_default=True),
+                name='unique_default_domain_per_site',
+            ),
+        ]
+
+    def __str__(self):
+        return self.domain
+
+    def save(self, *args, **kwargs):
+        """Force domains lowercase, mirroring Site.hostname."""
+        self.domain = self.domain.lower()
+        super().save(*args, **kwargs)
+
 
 class SiteApp(models.Model):
     """An app installed on a site."""

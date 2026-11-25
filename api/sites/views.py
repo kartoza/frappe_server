@@ -21,14 +21,16 @@ from rest_framework.views import APIView
 from benches.container_exec import get_client
 
 from . import bench_exec, sql_playground
-from .models import App, Backup, Job, Site, SiteApp
-from .serializers import AppSerializer, BackupSerializer, JobSerializer, SiteSerializer
+from .models import App, Backup, Job, Site, SiteApp, SiteDomain
+from .serializers import AppSerializer, BackupSerializer, JobSerializer, SiteDomainSerializer, SiteSerializer
 from .tasks import (
     backup_site_task,
     create_site_task,
     delete_site_task,
     install_app_task,
     migrate_site_task,
+    regenerate_nginx_task,
+    renew_ssl_certs_task,
     restore_database_from_upload_task,
     restore_site_task,
     toggle_maintenance_task,
@@ -131,6 +133,42 @@ class SiteViewSet(
         """Domains (see settings.ALLOWED_SITE_DOMAINS) a new site's hostname must fall under."""
         return Response({'domains': settings.ALLOWED_SITE_DOMAINS})
 
+    @action(detail=True, methods=['post'], url_path='set-default-domain')
+    def set_default_domain(self, request, pk=None):
+        """Mark one of this site's domains (its own hostname, or a custom one) as default.
+
+        The default domain is the one that actually serves content;
+        every other domain the site answers to redirects here (see
+        nginx_config.py). Setting it back to the site's own hostname just
+        clears every custom domain's default flag, rather than needing a
+        row of its own for the hostname case.
+        """
+        site = self.get_object()
+        domain = (request.data.get('domain') or '').lower()
+        if not domain:
+            return Response({'detail': 'domain is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if domain == site.hostname:
+            site.domains.update(is_default=False)
+        else:
+            target = site.domains.filter(domain=domain).first()
+            if not target:
+                return Response(
+                    {'detail': f'"{domain}" is not a domain on this site.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Clear every other default first so the partial unique
+            # constraint (at most one is_default=True per site) is never
+            # violated, even momentarily.
+            site.domains.exclude(pk=target.pk).update(is_default=False)
+            target.is_default = True
+            target.save(update_fields=['is_default'])
+
+        regenerate_nginx_task.delay()
+        if settings.SSL_ENABLED:
+            renew_ssl_certs_task.delay()
+        return Response(SiteSerializer(site).data)
+
     @action(detail=True, methods=['post'], url_path='install-app')
     def install_app(self, request, pk=None):
         """Install an already-fetched app onto this site.
@@ -207,6 +245,39 @@ class SiteViewSet(
         job = Job.objects.create(job_type=Job.TYPE_MAINTENANCE_TOGGLE, site=site, bench=site.bench)
         toggle_maintenance_task.delay(site.id, enabled, job.id)
         return Response({'job_id': job.id}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=['get', 'put'], url_path='site-config')
+    def site_config(self, request, pk=None):
+        """View or edit this site's site_config.json directly.
+
+        Separate from the upload-based restore-site-config flow (see
+        RESTORE_FINISHERS) — this is for making a quick change in place
+        rather than replacing the whole file from an external backup.
+        """
+        site = self.get_object()
+        if request.method == 'GET':
+            try:
+                config = bench_exec.read_site_config(site.bench, site)
+            except RuntimeError as exc:
+                return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(config)
+
+        config = request.data
+        if not isinstance(config, dict):
+            return Response(
+                {'detail': 'Body must be a JSON object.'}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        job = Job.objects.create(job_type=Job.TYPE_RESTORE_SITE_CONFIG, site=site, bench=site.bench)
+        job.mark_running()
+        try:
+            bench_exec.restore_site_config(site.bench, site, json.dumps(config, indent=1).encode())
+            job.append_log('site_config.json updated.\n')
+            job.mark_success()
+        except Exception as exc:  # noqa: BLE001
+            job.mark_failed(str(exc))
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'job_id': job.id}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='upload-chunk')
     def upload_chunk(self, request, pk=None):
@@ -393,6 +464,45 @@ RESTORE_FINISHERS = {
         site, path, Job.TYPE_RESTORE_PRIVATE_FILES, is_private=True
     ),
 }
+
+
+class SiteDomainViewSet(
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Add/remove custom domains (CNAMEs) on a site, on top of its own fixed hostname.
+
+    Deliberately no update: the only thing that ever changes about an
+    existing domain is which one is default, and that's a site-wide
+    operation (see SiteViewSet.set_default_domain) since it also has to
+    clear the flag on every *other* domain for this site.
+    """
+
+    queryset = SiteDomain.objects.all().order_by('-created_at')
+    serializer_class = SiteDomainSerializer
+
+    def get_queryset(self):
+        """Support ?site=<id> to scope domains to a single site."""
+        queryset = super().get_queryset()
+        site_id = self.request.query_params.get('site')
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save()
+        # Routing only takes effect once nginx picks up the new domain —
+        # that requires the nginx_conf volume, which only `worker` (and
+        # `proxy`) have mounted, not this `api` process, hence the task.
+        regenerate_nginx_task.delay()
+        if settings.SSL_ENABLED:
+            renew_ssl_certs_task.delay()
+
+    def perform_destroy(self, instance):
+        instance.delete()
+        regenerate_nginx_task.delay()
 
 
 class BackupViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):

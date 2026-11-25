@@ -1,6 +1,7 @@
 """Tests for Job state transitions, Site hostname normalization, nginx
 config generation, and app-fetch/install flows."""
 import io
+import json
 import os
 import tarfile
 import tempfile
@@ -137,6 +138,158 @@ class HostnameDomainWhitelistTests(APITestCase):
         self.assertEqual(response.data['domains'], ['localhost', 'kartoza.com'])
 
 
+class SiteDomainModelTests(TestCase):
+    """A site's own hostname is fixed and never gets a SiteDomain row —
+    these just cover the computed helpers built on top of that."""
+
+    def setUp(self):
+        server = Server.objects.create(name='localhost')
+        bench = Bench.objects.create(server=server, name='bench-a', status=Bench.STATUS_ACTIVE)
+        self.site = Site.objects.create(
+            bench=bench, hostname='demo.localhost', admin_password='pw', status=Site.STATUS_ACTIVE,
+        )
+
+    def test_default_domain_is_hostname_with_no_custom_domains(self):
+        self.assertEqual(self.site.default_domain, 'demo.localhost')
+        self.assertEqual(self.site.all_domains, ['demo.localhost'])
+
+    def test_default_domain_switches_once_a_custom_domain_is_marked_default(self):
+        from .models import SiteDomain
+
+        SiteDomain.objects.create(site=self.site, domain='shop.kartoza.com', is_default=True)
+        self.assertEqual(self.site.default_domain, 'shop.kartoza.com')
+        self.assertEqual(set(self.site.all_domains), {'demo.localhost', 'shop.kartoza.com'})
+
+    def test_only_one_default_domain_allowed_per_site(self):
+        from django.db import IntegrityError
+        from .models import SiteDomain
+
+        SiteDomain.objects.create(site=self.site, domain='a.kartoza.com', is_default=True)
+        with self.assertRaises(IntegrityError):
+            SiteDomain.objects.create(site=self.site, domain='b.kartoza.com', is_default=True)
+
+
+class SiteDomainViewSetTests(APITestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='admin@example.com', password='s3cret-pass', is_staff=True
+        )
+        self.client.force_authenticate(user=self.user)
+        server = Server.objects.create(name='localhost')
+        self.bench = Bench.objects.create(server=server, name='bench-a', status=Bench.STATUS_ACTIVE)
+        self.site = Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw', status=Site.STATUS_ACTIVE,
+        )
+
+    @patch('sites.views.regenerate_nginx_task')
+    def test_add_domain_outside_whitelist_is_rejected(self, mock_task):
+        response = self.client.post('/api/site-domains/', {'site': self.site.id, 'domain': 'shop.evil.com'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_task.delay.assert_not_called()
+
+    @patch('sites.views.regenerate_nginx_task')
+    def test_add_domain_already_a_site_hostname_is_rejected(self, mock_task):
+        Site.objects.create(bench=self.bench, hostname='other.localhost', admin_password='pw')
+        response = self.client.post('/api/site-domains/', {'site': self.site.id, 'domain': 'other.localhost'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_task.delay.assert_not_called()
+
+    @patch('sites.views.renew_ssl_certs_task')
+    @patch('sites.views.regenerate_nginx_task')
+    def test_add_domain_succeeds_and_triggers_nginx_regen(self, mock_regen, mock_ssl):
+        with override_settings(ALLOWED_SITE_DOMAINS=['localhost', 'kartoza.com']):
+            response = self.client.post(
+                '/api/site-domains/', {'site': self.site.id, 'domain': 'shop.kartoza.com'}
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.site.domains.count(), 1)
+        mock_regen.delay.assert_called_once()
+        mock_ssl.delay.assert_not_called()  # SSL_ENABLED defaults off
+
+    @patch('sites.views.regenerate_nginx_task')
+    def test_list_domains_filtered_by_site(self, mock_task):
+        from .models import SiteDomain
+
+        other_site = Site.objects.create(bench=self.bench, hostname='other.localhost', admin_password='pw')
+        SiteDomain.objects.create(site=self.site, domain='a.kartoza.com')
+        SiteDomain.objects.create(site=other_site, domain='b.kartoza.com')
+
+        response = self.client.get(f'/api/site-domains/?site={self.site.id}')
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['domain'], 'a.kartoza.com')
+
+    @patch('sites.views.regenerate_nginx_task')
+    def test_remove_domain(self, mock_task):
+        from .models import SiteDomain
+
+        domain = SiteDomain.objects.create(site=self.site, domain='a.kartoza.com')
+        response = self.client.delete(f'/api/site-domains/{domain.id}/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(SiteDomain.objects.filter(id=domain.id).exists())
+        mock_task.delay.assert_called_once()
+
+
+class SetDefaultDomainTests(APITestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='admin@example.com', password='s3cret-pass', is_staff=True
+        )
+        self.client.force_authenticate(user=self.user)
+        server = Server.objects.create(name='localhost')
+        self.bench = Bench.objects.create(server=server, name='bench-a', status=Bench.STATUS_ACTIVE)
+        self.site = Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw', status=Site.STATUS_ACTIVE,
+        )
+
+    @patch('sites.views.regenerate_nginx_task')
+    def test_set_a_custom_domain_as_default(self, mock_task):
+        from .models import SiteDomain
+
+        domain = SiteDomain.objects.create(site=self.site, domain='shop.kartoza.com')
+        response = self.client.post(
+            f'/api/sites/{self.site.id}/set-default-domain/', {'domain': 'shop.kartoza.com'}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        domain.refresh_from_db()
+        self.assertTrue(domain.is_default)
+        self.assertEqual(response.data['default_domain'], 'shop.kartoza.com')
+        mock_task.delay.assert_called_once()
+
+    @patch('sites.views.regenerate_nginx_task')
+    def test_switching_default_clears_the_previous_one(self, mock_task):
+        from .models import SiteDomain
+
+        first = SiteDomain.objects.create(site=self.site, domain='a.kartoza.com', is_default=True)
+        second = SiteDomain.objects.create(site=self.site, domain='b.kartoza.com')
+
+        response = self.client.post(f'/api/sites/{self.site.id}/set-default-domain/', {'domain': 'b.kartoza.com'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertFalse(first.is_default)
+        self.assertTrue(second.is_default)
+
+    @patch('sites.views.regenerate_nginx_task')
+    def test_set_back_to_the_sites_own_hostname(self, mock_task):
+        from .models import SiteDomain
+
+        custom = SiteDomain.objects.create(site=self.site, domain='shop.kartoza.com', is_default=True)
+        response = self.client.post(
+            f'/api/sites/{self.site.id}/set-default-domain/', {'domain': 'demo.localhost'}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        custom.refresh_from_db()
+        self.assertFalse(custom.is_default)
+        self.assertEqual(response.data['default_domain'], 'demo.localhost')
+
+    def test_rejects_a_domain_not_on_this_site(self):
+        response = self.client.post(
+            f'/api/sites/{self.site.id}/set-default-domain/', {'domain': 'not-mine.kartoza.com'}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
 class NginxConfigTests(TestCase):
     def setUp(self):
         server = Server.objects.create(name='localhost')
@@ -253,6 +406,68 @@ class NginxConfigTests(TestCase):
 
         self.assertIn('/.well-known/acme-challenge/', content)
 
+    @patch('sites.nginx_config.run_command', return_value=(0, ''))
+    @patch('sites.nginx_config._redis_client')
+    def test_every_domain_gets_x_frappe_site_name_set_to_the_real_hostname(
+        self, mock_redis_client, mock_run_command
+    ):
+        """Frappe resolves which site to serve from this header before
+        falling back to the Host header — without it, a request arriving
+        on a custom domain would look for a site folder matching that
+        domain, which doesn't exist."""
+        from .models import SiteDomain
+
+        site = Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        SiteDomain.objects.create(site=site, domain='shop.kartoza.com')
+        mock_lock = MagicMock()
+        mock_lock.__enter__ = MagicMock(return_value=None)
+        mock_lock.__exit__ = MagicMock(return_value=False)
+        mock_redis_client.return_value.lock.return_value = mock_lock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.settings(NGINX_CONF_DIR=tmp_dir):
+                nginx_config.regenerate_and_reload()
+                with open(f'{tmp_dir}/sites.conf', encoding='utf-8') as handle:
+                    content = handle.read()
+
+        # The custom domain isn't default yet, so it should redirect to
+        # the real hostname rather than carry its own proxy block.
+        self.assertIn('server_name demo.localhost', content)
+        self.assertIn('server_name shop.kartoza.com', content)
+        self.assertIn('X-Frappe-Site-Name demo.localhost', content)
+        self.assertIn('return 301 http://demo.localhost$request_uri', content)
+
+    @patch('sites.nginx_config.run_command', return_value=(0, ''))
+    @patch('sites.nginx_config._redis_client')
+    def test_non_default_domain_redirects_to_the_default_one(self, mock_redis_client, mock_run_command):
+        from .models import SiteDomain
+
+        site = Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        SiteDomain.objects.create(site=site, domain='shop.kartoza.com', is_default=True)
+        mock_lock = MagicMock()
+        mock_lock.__enter__ = MagicMock(return_value=None)
+        mock_lock.__exit__ = MagicMock(return_value=False)
+        mock_redis_client.return_value.lock.return_value = mock_lock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.settings(NGINX_CONF_DIR=tmp_dir):
+                nginx_config.regenerate_and_reload()
+                with open(f'{tmp_dir}/sites.conf', encoding='utf-8') as handle:
+                    content = handle.read()
+
+        # Now the *custom* domain carries the real proxy block, and the
+        # site's own original hostname redirects there instead.
+        self.assertIn('return 301 http://shop.kartoza.com$request_uri', content)
+        self.assertIn('X-Frappe-Site-Name demo.localhost', content)
+        self.assertNotIn('{{', content)
+        self.assertNotIn('}}', content)
+
 
 class SslAutomationTests(TestCase):
     """certbot itself is never actually invoked in tests — these mock the
@@ -280,6 +495,22 @@ class SslAutomationTests(TestCase):
         )
 
         hostnames = ssl_module.eligible_hostnames()
+        self.assertEqual(hostnames, ['shop.kartoza.com'])
+
+    def test_eligible_hostnames_includes_custom_domains(self):
+        from . import ssl as ssl_module
+        from .models import SiteDomain
+
+        site = Site.objects.create(
+            bench=self.bench, hostname='demo.localhost', admin_password='pw',
+            status=Site.STATUS_ACTIVE,
+        )
+        SiteDomain.objects.create(site=site, domain='shop.kartoza.com', is_default=True)
+
+        hostnames = ssl_module.eligible_hostnames()
+        # "demo.localhost" itself is still excluded (SSL_EXCLUDED_DOMAINS),
+        # but the custom domain layered on top of it needs its own cert
+        # regardless of which one is marked default.
         self.assertEqual(hostnames, ['shop.kartoza.com'])
 
     @patch('sites.ssl.subprocess.run')
@@ -899,6 +1130,66 @@ class SiteRestoreUploadTests(APITestCase):
     def test_restore_public_files_rejects_neither_zip_nor_tar(self):
         response = self._upload('restore-public-files', 'files.zip', b'not a zip or tar')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class SiteConfigEndpointTests(APITestCase):
+    """Viewing/editing site_config.json directly, as distinct from the
+    upload-a-whole-file restore flow above."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='admin@example.com', password='s3cret-pass', is_staff=True
+        )
+        self.client.force_authenticate(user=self.user)
+        server = Server.objects.create(name='localhost')
+        bench = Bench.objects.create(server=server, name='bench-a', frappe_branch='version-15')
+        self.site = Site.objects.create(
+            bench=bench, hostname='demo.localhost', admin_password='pw', status=Site.STATUS_ACTIVE,
+        )
+
+    @patch('sites.views.bench_exec.read_site_config', return_value={'db_name': '_abc123', 'maintenance_mode': 0})
+    def test_get_returns_the_current_config(self, mock_read):
+        response = self.client.get(f'/api/sites/{self.site.id}/site-config/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {'db_name': '_abc123', 'maintenance_mode': 0})
+
+    @patch('sites.views.bench_exec.read_site_config', side_effect=RuntimeError('not found'))
+    def test_get_surfaces_a_read_failure_as_400_not_500(self, mock_read):
+        response = self.client.get(f'/api/sites/{self.site.id}/site-config/')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch('sites.views.bench_exec.restore_site_config')
+    def test_put_rejects_a_non_object_body(self, mock_restore):
+        response = self.client.put(
+            f'/api/sites/{self.site.id}/site-config/', ['not', 'an', 'object'], format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        mock_restore.assert_not_called()
+
+    @patch('sites.views.bench_exec.restore_site_config')
+    def test_put_writes_the_edited_config_and_tracks_a_job(self, mock_restore):
+        response = self.client.put(
+            f'/api/sites/{self.site.id}/site-config/',
+            {'db_name': '_abc123', 'maintenance_mode': 1},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_restore.assert_called_once()
+        written = json.loads(mock_restore.call_args[0][2])
+        self.assertEqual(written, {'db_name': '_abc123', 'maintenance_mode': 1})
+
+        job = Job.objects.get(pk=response.data['job_id'])
+        self.assertEqual(job.job_type, Job.TYPE_RESTORE_SITE_CONFIG)
+        self.assertEqual(job.status, Job.STATUS_SUCCESS)
+
+    @patch('sites.views.bench_exec.restore_site_config', side_effect=RuntimeError('write failed'))
+    def test_put_marks_the_job_failed_on_write_error(self, mock_restore):
+        response = self.client.put(
+            f'/api/sites/{self.site.id}/site-config/', {'db_name': '_abc123'}, format='json'
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        job = Job.objects.filter(site=self.site, job_type=Job.TYPE_RESTORE_SITE_CONFIG).latest('created_at')
+        self.assertEqual(job.status, Job.STATUS_FAILED)
 
 
 class RestoreDatabaseTaskTests(TestCase):

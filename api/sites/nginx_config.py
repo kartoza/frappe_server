@@ -5,11 +5,21 @@ let nginx derive "which bench" from a hostname alone, one explicit
 server block per active site is generated and written to a file the proxy
 container has mounted, then nginx is told to reload.
 
-Every site's HTTP (port 80) block always serves the Let's Encrypt
+A site can answer to more than one domain (its own fixed hostname plus
+any number of custom domains — see SiteDomain): exactly one of those is
+its "default" domain, which gets the real proxy block; every other
+domain the site answers to just 301-redirects there. Whichever domain
+actually proxies sets the X-Frappe-Site-Name header to the site's real
+(immutable) hostname, since Frappe resolves which site to serve from
+that header first, falling back to the Host header only if it's absent —
+without it, a request arriving on a custom domain would resolve to a
+site folder matching that domain, which doesn't exist.
+
+Every domain's HTTP (port 80) block always serves the Let's Encrypt
 HTTP-01 challenge path itself, regardless of whether SSL is enabled or
-this particular hostname has a certificate yet — needed for the very
+this particular domain has a certificate yet — needed for the very
 first issuance (see sites.ssl) and for every later renewal once the
-hostname has its own server block instead of falling through to the
+domain has its own server block instead of falling through to the
 platform's default one.
 """
 import os
@@ -36,6 +46,7 @@ PROXY_LOCATIONS = """\
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_set_header Host $host;
+        proxy_set_header X-Frappe-Site-Name {site_hostname};
     }}
 
     location / {{
@@ -45,15 +56,18 @@ PROXY_LOCATIONS = """\
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {site_hostname};
         proxy_read_timeout 300;
     }}
 """
 
-# Rendered instead of PROXY_LOCATIONS in the HTTP block once a certificate
-# exists — everything but the ACME challenge path itself moves to HTTPS.
+# Used both for the same-domain HTTP->HTTPS upgrade (scheme="https",
+# target="$host" — a literal string, not python interpolation, so it's
+# nginx's own variable in the rendered file) and for a non-default
+# domain redirecting to wherever the default domain actually is.
 REDIRECT_LOCATION = """\
     location / {{
-        return 301 https://$host$request_uri;
+        return 301 {scheme}://{target}$request_uri;
     }}
 """
 
@@ -74,8 +88,7 @@ server {{
     ssl_certificate {cert_path};
     ssl_certificate_key {key_path};
 
-""" + PROXY_LOCATIONS + """\
-}}
+{body}}}
 """
 
 
@@ -83,28 +96,56 @@ def _redis_client():
     return redis.Redis.from_url(settings.CELERY_BROKER_URL)
 
 
-def _blocks_for_site(hostname, bench_container):
+def _blocks_for_domain(domain, *, is_default, default_domain, site_hostname, bench_container):
     from . import ssl as ssl_module
 
-    if settings.SSL_ENABLED and ssl_module.has_cert(hostname):
-        # .format() with no args still needs to run — it's what collapses
-        # this fragment's doubled "{{"/"}}" (needed so *this* string
-        # itself is valid when written standalone) down to the literal
-        # single braces nginx expects in the final file.
-        body = REDIRECT_LOCATION.format()
-        blocks = [
-            HTTP_TEMPLATE.format(hostname=hostname, webroot_dir=settings.SSL_WEBROOT_DIR, body=body),
+    has_own_cert = settings.SSL_ENABLED and ssl_module.has_cert(domain)
+    default_has_cert = settings.SSL_ENABLED and ssl_module.has_cert(default_domain)
+    # A non-default domain without its own cert yet can't terminate TLS at
+    # all, so it has to send plain-HTTP visitors straight to wherever the
+    # default domain currently lives rather than upgrading itself first.
+    redirect_to_default_scheme = 'https' if default_has_cert else 'http'
+
+    if is_default:
+        proxy_body = PROXY_LOCATIONS.format(bench_container=bench_container, site_hostname=site_hostname)
+        if not has_own_cert:
+            return [HTTP_TEMPLATE.format(hostname=domain, webroot_dir=settings.SSL_WEBROOT_DIR, body=proxy_body)]
+        http_body = REDIRECT_LOCATION.format(scheme='https', target='$host')
+        return [
+            HTTP_TEMPLATE.format(hostname=domain, webroot_dir=settings.SSL_WEBROOT_DIR, body=http_body),
             HTTPS_TEMPLATE.format(
-                hostname=hostname,
-                cert_path=ssl_module.cert_path(hostname),
-                key_path=ssl_module.key_path(hostname),
-                bench_container=bench_container,
+                hostname=domain, cert_path=ssl_module.cert_path(domain), key_path=ssl_module.key_path(domain),
+                body=proxy_body,
             ),
         ]
-    else:
-        body = PROXY_LOCATIONS.format(bench_container=bench_container)
-        blocks = [HTTP_TEMPLATE.format(hostname=hostname, webroot_dir=settings.SSL_WEBROOT_DIR, body=body)]
-    return blocks
+
+    if not has_own_cert:
+        body = REDIRECT_LOCATION.format(scheme=redirect_to_default_scheme, target=default_domain)
+        return [HTTP_TEMPLATE.format(hostname=domain, webroot_dir=settings.SSL_WEBROOT_DIR, body=body)]
+    http_body = REDIRECT_LOCATION.format(scheme='https', target='$host')
+    https_body = REDIRECT_LOCATION.format(scheme=redirect_to_default_scheme, target=default_domain)
+    return [
+        HTTP_TEMPLATE.format(hostname=domain, webroot_dir=settings.SSL_WEBROOT_DIR, body=http_body),
+        HTTPS_TEMPLATE.format(
+            hostname=domain, cert_path=ssl_module.cert_path(domain), key_path=ssl_module.key_path(domain),
+            body=https_body,
+        ),
+    ]
+
+
+def _blocks_for_site(site):
+    default_domain = site.default_domain
+    return [
+        block
+        for domain in site.all_domains
+        for block in _blocks_for_domain(
+            domain,
+            is_default=(domain == default_domain),
+            default_domain=default_domain,
+            site_hostname=site.hostname,
+            bench_container=site.bench.container_name,
+        )
+    ]
 
 
 def regenerate_and_reload():
@@ -117,12 +158,8 @@ def regenerate_and_reload():
 
     lock = _redis_client().lock(LOCK_KEY, timeout=LOCK_TIMEOUT)
     with lock:
-        active_sites = Site.objects.filter(status=Site.STATUS_ACTIVE).select_related('bench')
-        blocks = [
-            block
-            for site in active_sites
-            for block in _blocks_for_site(site.hostname, site.bench.container_name)
-        ]
+        active_sites = Site.objects.filter(status=Site.STATUS_ACTIVE).select_related('bench').prefetch_related('domains')
+        blocks = [block for site in active_sites for block in _blocks_for_site(site)]
         config = '\n'.join(blocks)
 
         conf_path = os.path.join(settings.NGINX_CONF_DIR, 'sites.conf')
