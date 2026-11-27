@@ -204,6 +204,46 @@ def update_app(bench, app, branch, job):
     _run(bench, ['build'], job)
 
 
+def _backup_prefix_and_enc(db_filename):
+    """Split a backup's database-dump filename into its shared prefix and "-enc" marker.
+
+    Mirrors frappe.utils.backups.BackupGenerator.set_backup_file_name: when
+    System Settings > "Encrypt Backup" is on, bench inserts an "-enc" marker
+    before each file's own extension (e.g. "...-database-enc.sql.gz",
+    "...-files-enc.tar"), not as a suffix shared by the whole set — so it
+    has to be detected from the db dump's name and re-applied to each other
+    file's name individually, not just string-replaced away.
+    """
+    if db_filename.endswith('-database-enc.sql.gz'):
+        return db_filename[: -len('-database-enc.sql.gz')], '-enc'
+    return db_filename[: -len('-database.sql.gz')], ''
+
+
+def backup_set_files(db_filename):
+    """Derive a backup set's public/private-files filenames from its database dump's.
+
+    :rtype: (str, str) — ``(public_files_filename, private_files_filename)``
+    """
+    prefix, enc = _backup_prefix_and_enc(db_filename)
+    return f'{prefix}-files{enc}.tar', f'{prefix}-private-files{enc}.tar'
+
+
+def delete_backup_files(bench, site, db_filename):
+    """Delete every file belonging to one backup set.
+
+    That's the database dump itself plus its public/private files archives
+    and its site_config_backup copy — ``rm -f`` so a backup taken without
+    files (or one that failed partway through) doesn't turn a missing file
+    into an error.
+    """
+    prefix, enc = _backup_prefix_and_enc(db_filename)
+    public_files, private_files = backup_set_files(db_filename)
+    conf_file = f'{prefix}-site_config_backup{enc}.json'
+    backups_dir = f'{bench.bench_path}/sites/{site.hostname}/private/backups'
+    paths = [f'{backups_dir}/{name}' for name in (db_filename, public_files, private_files, conf_file)]
+    run_command(bench.container_name, ['rm', '-f', *paths], user=BENCH_USER)
+
+
 def list_backups(bench, site):
     """List backup files present in a site's private/backups directory."""
     backups_dir = f'{bench.bench_path}/sites/{site.hostname}/private/backups'

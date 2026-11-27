@@ -213,7 +213,12 @@ def backup_site_task(site_id, job_id, backup_id):
     try:
         bench_exec.backup_site(site.bench, site, job)
         files = bench_exec.list_backups(site.bench, site)
-        db_files = sorted(f for f in files if f.endswith('-database.sql.gz'))
+        # Matches both the plain and "-enc" (System Settings > Encrypt
+        # Backup) naming schemes — see bench_exec.backup_set_files.
+        db_files = sorted(
+            f for f in files
+            if f.endswith('-database.sql.gz') or f.endswith('-database-enc.sql.gz')
+        )
         if db_files:
             latest = db_files[-1]
             backup.file_path = latest
@@ -240,12 +245,12 @@ def restore_site_task(site_id, backup_id, job_id):
 
     try:
         backups_dir = f'{site.bench.bench_path}/sites/{site.hostname}/private/backups'
-        prefix = backup.file_path.replace('-database.sql.gz', '')
+        public_files, private_files = bench_exec.backup_set_files(backup.file_path)
         bench_exec.restore_site(
             site.bench, site, job,
             db_file=f'{backups_dir}/{backup.file_path}',
-            public_files=f'{backups_dir}/{prefix}-files.tar',
-            private_files=f'{backups_dir}/{prefix}-private-files.tar',
+            public_files=f'{backups_dir}/{public_files}',
+            private_files=f'{backups_dir}/{private_files}',
         )
         job.mark_success()
     except Exception as exc:  # noqa: BLE001

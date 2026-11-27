@@ -505,8 +505,10 @@ class SiteDomainViewSet(
         regenerate_nginx_task.delay()
 
 
-class BackupViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
-    """List/retrieve backups, optionally filtered by ?site=<id>, plus download."""
+class BackupViewSet(
+    mixins.ListModelMixin, mixins.RetrieveModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet
+):
+    """List/retrieve/delete backups, optionally filtered by ?site=<id>, plus download."""
 
     serializer_class = BackupSerializer
 
@@ -516,6 +518,13 @@ class BackupViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.G
         if site_id:
             queryset = queryset.filter(site_id=site_id)
         return queryset
+
+    def perform_destroy(self, instance):
+        # No file_path means the backup never finished (still running, or
+        # failed before bench produced anything) — nothing on disk to clean up.
+        if instance.file_path:
+            bench_exec.delete_backup_files(instance.site.bench, instance.site, instance.file_path)
+        instance.delete()
 
     @action(detail=True, methods=['get'])
     def download(self, request, pk=None):

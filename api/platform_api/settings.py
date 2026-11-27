@@ -17,6 +17,11 @@ ALLOWED_HOSTS = [
 
 INSTALLED_APPS = [
     'django.contrib.admin',
+    # Listed before django.contrib.auth so its createsuperuser command (see
+    # accounts/management/commands/createsuperuser.py) overrides auth's own —
+    # Django's command lookup resolves collisions in favor of whichever app
+    # is listed earlier in this list.
+    'accounts',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
@@ -24,7 +29,6 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'django.contrib.postgres',
     'rest_framework',
-    'accounts',
     'benches',
     'sites',
 ]

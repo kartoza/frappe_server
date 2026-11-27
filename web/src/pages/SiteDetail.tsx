@@ -263,6 +263,23 @@ export default function SiteDetail() {
     await downloadFile(`/backups/${backup.id}/download/`, `${backup.file_path}.tar`);
   }
 
+  async function handleDeleteBackup(backup: Backup) {
+    if (
+      !window.confirm(
+        `Delete the backup taken ${new Date(backup.created_at).toLocaleString()}? This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    setError('');
+    try {
+      await api.delete(`/backups/${backup.id}/`);
+      setBackups((prev) => prev.filter((b) => b.id !== backup.id));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not delete backup.');
+    }
+  }
+
   async function handleRestoreFromBackup(backup: Backup) {
     if (
       !window.confirm(
@@ -591,6 +608,12 @@ export default function SiteDetail() {
                     </button>
                   </>
                 )}
+                <button
+                  onClick={() => handleDeleteBackup(backup)}
+                  className="text-sm text-slate-400 hover:text-rose-300"
+                >
+                  Delete
+                </button>
               </div>
             </li>
           ))}

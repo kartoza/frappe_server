@@ -38,6 +38,27 @@ ACME_CHALLENGE_LOCATION = """\
     }}
 """
 
+# Frappe's own static-file middleware for /files/ (serving a site's public
+# uploads) ignores X-Frappe-Site-Name entirely and derives the site folder
+# straight from the raw Host header instead (see frappe/middlewares.py's
+# StaticDataMiddleware) - unlike every dynamic route, which checks that
+# header first. So a request for /files/... arriving on anything other than
+# the site's own immutable hostname would 404 looking for a site folder
+# matching the custom domain, which never exists. Overriding Host here is
+# the only way to make this one path resolve correctly too.
+FILES_LOCATION = """\
+    location /files/ {{
+        set $bench_web http://{bench_container}:8000;
+        proxy_pass $bench_web;
+        proxy_set_header Host {site_hostname};
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Frappe-Site-Name {site_hostname};
+        proxy_read_timeout 300;
+    }}
+"""
+
 PROXY_LOCATIONS = """\
     location /socket.io/ {{
         set $bench_socketio http://{bench_container}:9000;
@@ -48,6 +69,8 @@ PROXY_LOCATIONS = """\
         proxy_set_header Host $host;
         proxy_set_header X-Frappe-Site-Name {site_hostname};
     }}
+
+""" + FILES_LOCATION + """\
 
     location / {{
         set $bench_web http://{bench_container}:8000;
